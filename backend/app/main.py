@@ -25,6 +25,9 @@ app.include_router(fix_router)
 app.include_router(health_router)
 app.include_router(queries_router)
 
+@app.get("/")
+def home():
+    return {"message": "Welcome to the slow trace"}
 
 @app.get("/health")
 def health():
