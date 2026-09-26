@@ -4,46 +4,16 @@ import ConnectionLostCard from '@/components/ConnectionLostCard'
 import EmptyState from '@/components/EmptyState'
 import ErrorCard from '@/components/ErrorCard'
 import { Skeleton } from '@/components/Skeleton'
-
-// ---------------------------------------------------------------------------
-// Types matching the SSE envelope from GET /api/scan/{connection_id}
-// ---------------------------------------------------------------------------
-
-interface ConnectedData {
-  version?: string
-  size?: string
-  table_count?: number
-  total_rows?: number
-  error?: string
-}
-
-interface HealthCheckData {
-  check: string
-  status: 'ok' | 'warning' | 'fail'
-  message?: string
-  [key: string]: unknown
-}
-
-interface SlowQueriesData {
-  queries: unknown[]
-  total_wasted_minutes: number
-  human_description: string
-}
-
-interface CompleteData {
-  health_score: number
-  critical_count: number
-  warning_count: number
-  healthy_count: number
-  quick_wins: { check: string; fix: string }[]
-}
-
-type SseStage = 'connected' | 'health_check' | 'slow_queries' | 'complete'
-
-interface SseEvent {
-  stage: SseStage
-  data: Record<string, unknown>
-}
+import { useActiveConnection } from '@/lib/activeConnection'
+import { getScanSnapshot, saveScanSnapshot } from '@/lib/scanSnapshot'
+import type {
+  ScanCompleteData as CompleteData,
+  ScanConnectedData as ConnectedData,
+  ScanHealthCheck as HealthCheckData,
+  ScanSlowQuerySummary as SlowQueriesData,
+  ScanSnapshot,
+  ScanSseEvent as SseEvent,
+} from '@/types/scan'
 
 // ---------------------------------------------------------------------------
 // Total event count used to drive the progress bar.
@@ -154,7 +124,7 @@ function HealthRow({ check, index }: { check: HealthCheckData; index: number }) 
 }
 
 function SlowQueriesCard({ data }: { data: SlowQueriesData }) {
-  const count = data.queries.length
+  const count = data.count
   const minutes = data.total_wasted_minutes
 
   const wastedText =
@@ -264,50 +234,80 @@ function ScanSkeleton() {
 // Main page
 // ---------------------------------------------------------------------------
 
+type Phase = 'idle' | 'ready' | 'connecting' | 'scanning' | 'done' | 'error'
+
 export default function ScanPage() {
-  const { id: connectionId } = useParams<{ id: string }>()
+  const { id: routeConnectionId } = useParams<{ id?: string }>()
+  const activeConnection = useActiveConnection()
+  // Fall back to the persisted connection so bare /scan still works after a
+  // nav click, reload or bookmark.
+  const connectionId = routeConnectionId ?? activeConnection?.id ?? ''
   const navigate = useNavigate()
 
-  // Phase tracking
-  const [phase, setPhase] = useState<'connecting' | 'scanning' | 'done' | 'error'>(
-    connectionId ? 'connecting' : 'idle' as never,
-  )
-  const [progress, setProgress] = useState(0)
-  const [errorKind, setErrorKind] = useState<'connection' | 'error' | null>(null)
-  const [attempt, setAttempt] = useState(0)
-
-  // Received data
-  const [connectedData, setConnectedData] = useState<ConnectedData | null>(null)
-  const [healthChecks, setHealthChecks] = useState<HealthCheckData[]>([])
-  const [slowQueriesData, setSlowQueriesData] = useState<SlowQueriesData | null>(null)
-  const [completeData, setCompleteData] = useState<CompleteData | null>(null)
-
-  // Nickname from location state (passed by WelcomePage — optional)
-  const [nickname] = useState<string>(() => {
+  // Nickname from the persisted connection, falling back to router state.
+  const [historyNickname] = useState<string>(() => {
     try {
       return (history.state as { usr?: { nickname?: string } })?.usr?.nickname ?? ''
     } catch {
       return ''
     }
   })
+  const nickname = activeConnection?.nickname || historyNickname
+
+  // A scan runs only when the user asks for one (runId > 0). Revisits render
+  // the persisted snapshot instead of re-fetching.
+  const [runId, setRunId] = useState(0)
+  const [snapshot, setSnapshot] = useState<ScanSnapshot | null>(() =>
+    getScanSnapshot(connectionId),
+  )
+  const [phase, setPhase] = useState<Phase>(() => {
+    if (!connectionId) return 'idle'
+    return getScanSnapshot(connectionId) ? 'done' : 'ready'
+  })
+  const [progress, setProgress] = useState(() =>
+    getScanSnapshot(connectionId) ? 100 : 0,
+  )
+  const [errorKind, setErrorKind] = useState<'connection' | 'error' | null>(null)
+  const [justFinished, setJustFinished] = useState(false)
+
+  // Received data — seeded from the persisted snapshot, if any.
+  const [connectedData, setConnectedData] = useState<ConnectedData | null>(
+    () => getScanSnapshot(connectionId)?.connectedData ?? null,
+  )
+  const [healthChecks, setHealthChecks] = useState<HealthCheckData[]>(
+    () => getScanSnapshot(connectionId)?.healthChecks ?? [],
+  )
+  const [slowQueriesData, setSlowQueriesData] = useState<SlowQueriesData | null>(
+    () => getScanSnapshot(connectionId)?.slowQuerySummary ?? null,
+  )
+  const [completeData, setCompleteData] = useState<CompleteData | null>(
+    () => getScanSnapshot(connectionId)?.completeData ?? null,
+  )
 
   const eventsReceived = useRef(0)
   const esRef = useRef<EventSource | null>(null)
+  // Mirrors streamed data so the snapshot written on completion is complete.
+  const collectedRef = useRef<{
+    connectedData: ConnectedData | null
+    healthChecks: HealthCheckData[]
+    slowQuerySummary: SlowQueriesData | null
+  }>({ connectedData: null, healthChecks: [], slowQuerySummary: null })
+
+  const startScan = () => setRunId((n) => n + 1)
 
   useEffect(() => {
-    // If no connectionId, this is the legacy /scan route — nothing to stream
-    if (!connectionId) {
-      setPhase('idle' as never)
-      return
-    }
+    // No connection, or the user has not asked for a scan — show cached data.
+    if (!connectionId || runId === 0) return
 
     setPhase('connecting')
     setProgress(0)
     setErrorKind(null)
+    setJustFinished(false)
     setConnectedData(null)
     setHealthChecks([])
     setSlowQueriesData(null)
     setCompleteData(null)
+    collectedRef.current = { connectedData: null, healthChecks: [], slowQuerySummary: null }
     eventsReceived.current = 0
 
     let finished = false
@@ -338,23 +338,53 @@ export default function ScanPage() {
       const { stage, data } = parsed
 
       if (stage === 'connected') {
-        setConnectedData(data as ConnectedData)
-        if ((data as ConnectedData).error) {
+        const connected = data as ConnectedData
+        collectedRef.current.connectedData = connected
+        setConnectedData(connected)
+        if (connected.error) {
           finished = true
           setErrorKind('connection')
           setPhase('error')
           es.close()
         }
       } else if (stage === 'health_check') {
-        setHealthChecks((prev) => [...prev, data as HealthCheckData])
+        const check = data as HealthCheckData
+        collectedRef.current.healthChecks = [...collectedRef.current.healthChecks, check]
+        setHealthChecks(collectedRef.current.healthChecks)
       } else if (stage === 'slow_queries') {
-        setSlowQueriesData(data as unknown as SlowQueriesData)
+        const raw = data as {
+          queries?: unknown[]
+          total_wasted_minutes?: number
+          human_description?: string
+        }
+        const summary: SlowQueriesData = {
+          count: raw.queries?.length ?? 0,
+          total_wasted_minutes: raw.total_wasted_minutes ?? 0,
+          human_description: raw.human_description ?? '',
+        }
+        collectedRef.current.slowQuerySummary = summary
+        setSlowQueriesData(summary)
       } else if (stage === 'complete') {
-        setCompleteData(data as unknown as CompleteData)
+        const complete = data as unknown as CompleteData
+        setCompleteData(complete)
         setProgress(100)
         setPhase('done')
+        setJustFinished(true)
         finished = true
         es.close()
+
+        // Persist the finished scan so revisiting it needs no API call.
+        const saved: ScanSnapshot = {
+          connectionId,
+          connectedData: collectedRef.current.connectedData,
+          healthChecks: collectedRef.current.healthChecks,
+          slowQuerySummary: collectedRef.current.slowQuerySummary,
+          completeData: complete,
+          updatedAt: Date.now(),
+        }
+        saveScanSnapshot(saved)
+        setSnapshot(saved)
+
         // Navigate to dashboard after 1 second
         setTimeout(() => {
           navigate(`/dashboard/${connectionId}`)
@@ -374,36 +404,39 @@ export default function ScanPage() {
       es.close()
       esRef.current = null
     }
-  }, [connectionId, attempt, navigate])
+  }, [connectionId, runId, navigate])
 
-  // ── No connectionId: legacy scan page shell ─────────────────────────────
+  // ── No connectionId: nothing connected yet ──────────────────────────────
   if (!connectionId) {
     return (
       <div className="p-8 max-w-2xl mx-auto">
         <h1 className="text-2xl font-bold mb-2">Database Scan</h1>
         <p className="text-slate-400">
           Connect from the{' '}
-          <a href="/" className="text-indigo-400 hover:underline">
+          <Link to="/" className="text-indigo-400 hover:underline">
             home page
-          </a>{' '}
+          </Link>{' '}
           to start a scan.
         </p>
       </div>
     )
   }
 
-  const headingText =
-    phase === 'connecting'
-      ? 'Connecting…'
-      : phase === 'done'
-        ? 'Scan complete!'
-        : phase === 'error'
-          ? 'Scan stopped'
-          : `Scanning${nickname ? ` ${nickname}` : ''}…`
+  const isScanning = phase === 'connecting' || phase === 'scanning'
 
-  const hasData =
-    Boolean(connectedData) || healthChecks.length > 0 || Boolean(slowQueriesData)
-  const showSkeleton = phase === 'connecting' || (phase === 'scanning' && !hasData)
+  const headingText = isScanning
+    ? phase === 'connecting'
+      ? 'Connecting…'
+      : `Scanning${nickname ? ` ${nickname}` : ''}…`
+    : phase === 'done'
+      ? 'Scan complete!'
+      : phase === 'error'
+        ? 'Scan stopped'
+        : 'Database Scan'
+
+  const hasResults =
+    Boolean(connectedData) || healthChecks.length > 0 || Boolean(completeData)
+  const showSkeleton = phase === 'connecting' || (phase === 'scanning' && !hasResults)
 
   return (
     <>
@@ -425,22 +458,44 @@ export default function ScanPage() {
         </Link>
 
         {/* Header */}
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold text-white">
-            {headingText}
-          </h1>
-          {phase === 'scanning' && (
-            <p className="mt-1 text-sm text-slate-400">
-              Analysing your database health in real time…
-            </p>
+        <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold text-white">
+              {headingText}
+            </h1>
+            {phase === 'scanning' && (
+              <p className="mt-1 text-sm text-slate-400">
+                Analysing your database health in real time…
+              </p>
+            )}
+            {phase === 'ready' && (
+              <p className="mt-1 text-sm text-slate-400">
+                Nothing is fetched until you start a scan.
+              </p>
+            )}
+            {phase === 'done' && snapshot && (
+              <p className="mt-1 text-xs text-slate-500">
+                Last scanned {new Date(snapshot.updatedAt).toLocaleString()}
+              </p>
+            )}
+          </div>
+          {phase === 'done' && (
+            <button
+              onClick={startScan}
+              className="shrink-0 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-500"
+            >
+              ↺ Rescan
+            </button>
           )}
         </div>
 
         {/* Progress bar */}
-        <div className="mb-8">
-          <ProgressBar pct={progress} />
-          <p className="mt-1.5 text-right text-xs text-slate-500">{progress}%</p>
-        </div>
+        {(isScanning || justFinished) && (
+          <div className="mb-8">
+            <ProgressBar pct={progress} />
+            <p className="mt-1.5 text-right text-xs text-slate-500">{progress}%</p>
+          </div>
+        )}
 
         {/* Skeleton — shown until the first results arrive */}
         {showSkeleton && (
@@ -458,13 +513,30 @@ export default function ScanPage() {
               <ErrorCard
                 title="Could not finish the scan"
                 message="The scan stopped before it finished. Check that your database is reachable, then try again."
-                onRetry={() => setAttempt((n) => n + 1)}
+                onRetry={startScan}
               />
             )}
           </div>
         )}
 
-        {/* Streaming results */}
+        {/* No scan yet — the only way a scan starts is this button */}
+        {phase === 'ready' && (
+          <EmptyState
+            icon="🔍"
+            title="Ready to scan"
+            description="SlowTrace will check your database health and find slow queries. Nothing is fetched until you start."
+            action={
+              <button
+                onClick={startScan}
+                className="rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white shadow transition-colors hover:bg-indigo-500"
+              >
+                🔍 Scan Database
+              </button>
+            }
+          />
+        )}
+
+        {/* Results */}
         <div className="space-y-5">
           {/* Connected card */}
           {connectedData && <ConnectedCard data={connectedData} />}
@@ -485,7 +557,7 @@ export default function ScanPage() {
 
           {/* Slow queries */}
           {slowQueriesData &&
-            (slowQueriesData.queries.length === 0 ? (
+            (slowQueriesData.count === 0 ? (
               <EmptyState
                 icon="🎉"
                 title="🎉 No slow queries detected! Your database is performing well."
@@ -498,7 +570,7 @@ export default function ScanPage() {
           {completeData && <CompleteCard data={completeData} />}
 
           {/* Done banner */}
-          {phase === 'done' && (
+          {justFinished && (
             <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-5 py-3 text-sm font-medium text-emerald-300">
               ✅ Scan complete — redirecting to dashboard…
             </div>

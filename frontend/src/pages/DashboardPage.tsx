@@ -6,6 +6,7 @@ import EmptyState from '@/components/EmptyState'
 import ErrorCard from '@/components/ErrorCard'
 import { Skeleton, SkeletonText } from '@/components/Skeleton'
 import { friendlyError, isConnectionError } from '@/lib/errors'
+import { useActiveConnection } from '@/lib/activeConnection'
 
 // ---------------------------------------------------------------------------
 // Data fetching
@@ -372,7 +373,11 @@ function DashboardSkeleton() {
 const REFRESH_INTERVAL_MS = 30_000
 
 export default function DashboardPage() {
-  const { id: connectionId } = useParams<{ id: string }>()
+  const { id: routeConnectionId } = useParams<{ id?: string }>()
+  const activeConnection = useActiveConnection()
+  // Fall back to the persisted connection so bare /dashboard (nav click,
+  // bookmark, reload) still shows the database the user is connected to.
+  const connectionId = routeConnectionId ?? activeConnection?.id
   const navigate = useNavigate()
 
   const [status, setStatus] = useState<'loading' | 'loaded' | 'error'>('loading')

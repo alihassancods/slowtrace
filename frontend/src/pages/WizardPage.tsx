@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import ConnectionLostCard from '@/components/ConnectionLostCard'
+import { useActiveConnection } from '@/lib/activeConnection'
 
 // ---------------------------------------------------------------------------
 // Types & data
@@ -491,7 +492,11 @@ function Step3({
 // ---------------------------------------------------------------------------
 
 export default function WizardPage() {
-  const { id: connectionId = '' } = useParams<{ id?: string }>()
+  const { id: routeConnectionId } = useParams<{ id?: string }>()
+  const activeConnection = useActiveConnection()
+  // Fall back to the persisted connection so bare /wizard still targets the
+  // database the user is connected to.
+  const connectionId = routeConnectionId || activeConnection?.id || ''
   const navigate = useNavigate()
 
   const [step, setStep] = useState<Step>(1)

@@ -1,8 +1,16 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { friendlyError } from '@/lib/errors'
+import { setActiveConnection, useActiveConnection } from '@/lib/activeConnection'
 
 type InputMode = 'string' | 'fields'
+
+/** One step of the streamed connection test, as sent by POST /api/connections/test. */
+interface TestStep {
+  step: string
+  status: 'ok' | 'warning' | 'fail'
+  data?: { message?: string; fix?: string }
+}
 
 interface IndividualFields {
   host: string
@@ -21,6 +29,7 @@ function buildConnectionString(fields: IndividualFields): string {
 
 export default function WelcomePage() {
   const navigate = useNavigate()
+  const activeConnection = useActiveConnection()
 
   const [inputMode, setInputMode] = useState<InputMode>('string')
   const [connectionString, setConnectionString] = useState('')
@@ -34,6 +43,8 @@ export default function WelcomePage() {
   const [nickname, setNickname] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
+  const [errorFix, setErrorFix] = useState<string | null>(null)
 
   function getConnectionString(): string {
     if (inputMode === 'string') return connectionString.trim()
@@ -47,6 +58,8 @@ export default function WelcomePage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError(null)
+    setErrorDetail(null)
+    setErrorFix(null)
 
     const dsn = getConnectionString()
     if (!dsn) {
@@ -95,15 +108,33 @@ export default function WelcomePage() {
           }
 
           if (parsed.step === 'result') {
-            const data = parsed.data
+            const data = parsed.data as {
+              success?: boolean
+              connection_id?: string
+              nickname?: string
+              steps?: TestStep[]
+            }
             if (data.success && data.connection_id) {
+              setActiveConnection({
+                id: data.connection_id,
+                nickname: data.nickname ?? nickname.trim(),
+                dsn,
+                connectedAt: Date.now(),
+              })
               navigate(`/scan/${data.connection_id}`)
             } else {
-              const raw = data.message as string | undefined
-              if (raw) console.error('Connection test failed:', raw)
+              const steps = data.steps ?? []
+              const failed = steps.find((s) => s.status === 'fail')
+              // The backend curates these messages for display, so show the
+              // failing step's reason — it is the only actionable detail here.
+              console.error('Connection test failed:', steps)
               setError(
-                'We could not connect to that database. Check the host, port, database name, username, and password, then try again.',
+                !failed || failed.step === 'connect'
+                  ? 'We could not connect to that database.'
+                  : 'We connected, but could not finish reading your database statistics.',
               )
+              setErrorDetail(failed?.data?.message ?? null)
+              setErrorFix(failed?.data?.fix ?? null)
             }
             break outer
           }
@@ -119,6 +150,27 @@ export default function WelcomePage() {
   return (
     <div className="flex min-h-[calc(100vh-3.5rem)] items-center justify-center px-4 py-12">
       <div className="w-full max-w-md">
+        {/* Active connection — survives navigation and reloads */}
+        {activeConnection && (
+          <div className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-3">
+            <span className="flex min-w-0 items-center gap-2 text-sm text-emerald-300">
+              <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />
+              <span className="truncate">
+                Connected to{' '}
+                <span className="font-semibold">
+                  {activeConnection.nickname || 'your database'}
+                </span>
+              </span>
+            </span>
+            <Link
+              to={`/dashboard/${activeConnection.id}`}
+              className="shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-500"
+            >
+              Dashboard →
+            </Link>
+          </div>
+        )}
+
         {/* Hero */}
         <div className="mb-8 text-center">
           <h1 className="text-5xl font-extrabold tracking-tight text-white">
@@ -281,9 +333,19 @@ export default function WelcomePage() {
 
             {/* Inline error */}
             {error && (
-              <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2.5 text-sm text-red-300">
-                {error}
-              </p>
+              <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2.5">
+                <p className="text-sm text-red-300">{error}</p>
+                {errorDetail && (
+                  <p className="mt-1.5 whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-red-200/90">
+                    {errorDetail}
+                  </p>
+                )}
+                {errorFix && (
+                  <p className="mt-1.5 text-xs text-red-200/80">
+                    Try: <span className="font-mono">{errorFix}</span>
+                  </p>
+                )}
+              </div>
             )}
 
             {/* Submit */}

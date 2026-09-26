@@ -6,6 +6,7 @@ import ConnectionLostCard from '@/components/ConnectionLostCard'
 import ErrorCard from '@/components/ErrorCard'
 import { Skeleton, SkeletonText } from '@/components/Skeleton'
 import { friendlyError, isConnectionError } from '@/lib/errors'
+import { useActiveConnection } from '@/lib/activeConnection'
 
 // ---------------------------------------------------------------------------
 // API types
@@ -62,6 +63,7 @@ async function saveFix(
   queryid: string,
   fixSql: string,
   rollbackSql: string,
+  impact?: ExpectedImpact,
 ): Promise<string> {
   const resp = await fetch('/api/fixes/save', {
     method: 'POST',
@@ -71,6 +73,9 @@ async function saveFix(
       queryid,
       fix_sql: fixSql,
       rollback_sql: rollbackSql,
+      query_time_before_ms: impact?.before_ms,
+      query_time_after_ms: impact?.after_ms,
+      time_saved_per_day_minutes: impact?.time_saved_per_day_minutes,
     }),
   })
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
@@ -393,8 +398,9 @@ export default function FixPage() {
     id?: string
   }>()
   const navigate = useNavigate()
+  const activeConnection = useActiveConnection()
 
-  const connId = connectionId ?? ''
+  const connId = connectionId ?? activeConnection?.id ?? ''
   const qid = queryid ?? legacyId ?? ''
   const backTo = connId && qid ? `/query/${connId}/${qid}` : '/dashboard'
 
@@ -449,7 +455,13 @@ export default function FixPage() {
     // Step 1: save fix to history to obtain a fix_id
     let savedFixId: string
     try {
-      savedFixId = await saveFix(connId, qid, genData.fix_sql, genData.rollback_sql)
+      savedFixId = await saveFix(
+        connId,
+        qid,
+        genData.fix_sql,
+        genData.rollback_sql,
+        genData.expected_impact,
+      )
     } catch (err: unknown) {
       console.error('Failed to save fix before applying:', err)
       setApplySteps([
@@ -692,7 +704,9 @@ export default function FixPage() {
               <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-5 space-y-3">
                 <div>
                   <p className="text-base font-semibold text-white">
-                    {problemSubtitle(genData.problem.type)}
+                    {genData.problem.type
+                      ? problemSubtitle(genData.problem.type)
+                      : 'No specific problem detected'}
                   </p>
                   {genData.problem.table && (
                     <p className="mt-0.5 text-xs text-slate-500">
@@ -707,76 +721,100 @@ export default function FixPage() {
               </div>
             </Section>
 
-            {/* ── Section 2: The Fix ────────────────────────────────────── */}
-            <Section title="The Fix">
-              <div className="space-y-3">
-                <div className="rounded-xl border border-slate-700 bg-slate-950 overflow-hidden">
-                  <div className="flex items-center justify-between gap-3 border-b border-slate-700/60 bg-slate-900 px-4 py-2">
-                    <span className="text-xs font-medium text-slate-400">SQL</span>
-                    <CopyButton text={genData.fix_sql} />
+            {genData.problem.type ? (
+              <>
+                {/* ── Section 2: The Fix ────────────────────────────────── */}
+                <Section title="The Fix">
+                  <div className="space-y-3">
+                    <div className="rounded-xl border border-slate-700 bg-slate-950 overflow-hidden">
+                      <div className="flex items-center justify-between gap-3 border-b border-slate-700/60 bg-slate-900 px-4 py-2">
+                        <span className="text-xs font-medium text-slate-400">SQL</span>
+                        <CopyButton text={genData.fix_sql} />
+                      </div>
+                      <SqlBlock sql={genData.fix_sql} />
+                    </div>
+                    <p className="text-sm text-slate-400 leading-relaxed">
+                      {genData.problem.type === 'missing_index' || genData.problem.type === 'seq_scan'
+                        ? 'Creates a B-tree index with CONCURRENTLY so existing queries are not blocked while it builds.'
+                        : genData.problem.type === 'select_star'
+                          ? 'Replace SELECT * with only the columns your application needs to reduce data transfer and allow better query planning.'
+                          : genData.problem.type === 'n_plus_one'
+                            ? 'Batch individual lookups into a single query to eliminate the N+1 round-trip overhead.'
+                            : genData.problem.type === 'missing_limit'
+                              ? 'Add LIMIT to prevent the database from returning unbounded result sets.'
+                              : 'Apply this fix to resolve the detected performance problem.'}
+                    </p>
                   </div>
-                  <SqlBlock sql={genData.fix_sql} />
-                </div>
-                <p className="text-sm text-slate-400 leading-relaxed">
-                  {genData.problem.type === 'missing_index' || genData.problem.type === 'seq_scan'
-                    ? 'Creates a B-tree index with CONCURRENTLY so existing queries are not blocked while it builds.'
-                    : genData.problem.type === 'select_star'
-                      ? 'Replace SELECT * with only the columns your application needs to reduce data transfer and allow better query planning.'
-                      : genData.problem.type === 'n_plus_one'
-                        ? 'Batch individual lookups into a single query to eliminate the N+1 round-trip overhead.'
-                        : genData.problem.type === 'missing_limit'
-                          ? 'Add LIMIT to prevent the database from returning unbounded result sets.'
-                          : 'Apply this fix to resolve the detected performance problem.'}
-                </p>
-              </div>
-            </Section>
+                </Section>
 
-            {/* ── Section 3: Expected Impact ────────────────────────────── */}
-            <ImpactSection impact={genData.expected_impact} />
+                {/* ── Section 3: Expected Impact ────────────────────────── */}
+                <ImpactSection impact={genData.expected_impact} />
 
-            {/* ── Section 4: Safety ─────────────────────────────────────── */}
-            <SafetySection fixSql={genData.fix_sql} />
+                {/* ── Section 4: Safety ─────────────────────────────────── */}
+                <SafetySection fixSql={genData.fix_sql} />
 
-            {/* ── Apply progress (shown while applying / after) ─────────── */}
-            {(phase === 'applying' || phase === 'success') && applySteps.length > 0 && (
-              <Section title="Applying Fix">
-                <ApplyProgress steps={applySteps} />
-                {phase === 'success' && (
-                  <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-5 py-3 text-sm font-medium text-emerald-300">
-                    ✅ Fix applied successfully — redirecting to result…
-                  </div>
+                {/* ── Apply progress (shown while applying / after) ─────── */}
+                {(phase === 'applying' || phase === 'success') && applySteps.length > 0 && (
+                  <Section title="Applying Fix">
+                    <ApplyProgress steps={applySteps} />
+                    {phase === 'success' && (
+                      <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-5 py-3 text-sm font-medium text-emerald-300">
+                        ✅ Fix applied successfully — redirecting to result…
+                      </div>
+                    )}
+                  </Section>
                 )}
-              </Section>
-            )}
 
-            {/* ── Section 5: Actions ────────────────────────────────────── */}
-            {(phase === 'ready' || phase === 'error') && (
-              <Section title="Actions">
-                <div className="space-y-3">
-                  <button
-                    onClick={handleApplyClick}
-                    disabled={phase !== 'ready'}
-                    className="w-full rounded-xl bg-emerald-600 py-3.5 text-sm font-bold text-white shadow-lg transition-colors hover:bg-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
+                {/* ── Section 5: Actions ────────────────────────────────── */}
+                {(phase === 'ready' || phase === 'error') && (
+                  <Section title="Actions">
+                    <div className="space-y-3">
+                      <button
+                        onClick={handleApplyClick}
+                        disabled={phase !== 'ready'}
+                        className="w-full rounded-xl bg-emerald-600 py-3.5 text-sm font-bold text-white shadow-lg transition-colors hover:bg-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        ✅ Apply This Fix
+                      </button>
+
+                      <div className="flex items-center gap-3">
+                        <CopyButton text={genData.fix_sql} label="Copy SQL" />
+                        <span className="flex-1" />
+                        <Link
+                          to={backTo}
+                          className="text-sm text-slate-500 hover:text-slate-300 transition-colors"
+                        >
+                          ← Back
+                        </Link>
+                        <button
+                          onClick={() => navigate(backTo)}
+                          className="text-sm text-slate-500 hover:text-red-400 transition-colors"
+                        >
+                          ❌ Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </Section>
+                )}
+              </>
+            ) : (
+              <Section title="No Automated Fix">
+                <div className="space-y-2 rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+                  <p className="text-sm font-semibold text-slate-200">
+                    SlowTrace could not generate a fix for this query.
+                  </p>
+                  <p className="text-sm leading-relaxed text-slate-400">
+                    No known problem pattern matched. The query may already be indexed, or the
+                    slowdown is not caused by a missing index, <span className="font-mono">SELECT *</span>,
+                    an N+1 pattern or a missing LIMIT. Review the execution plan and stats on the
+                    query detail page.
+                  </p>
+                  <Link
+                    to={backTo}
+                    className="inline-block pt-1 text-sm text-indigo-400 transition-colors hover:text-indigo-300"
                   >
-                    ✅ Apply This Fix
-                  </button>
-
-                  <div className="flex items-center gap-3">
-                    <CopyButton text={genData.fix_sql} label="Copy SQL" />
-                    <span className="flex-1" />
-                    <Link
-                      to={backTo}
-                      className="text-sm text-slate-500 hover:text-slate-300 transition-colors"
-                    >
-                      ← Back
-                    </Link>
-                    <button
-                      onClick={() => navigate(backTo)}
-                      className="text-sm text-slate-500 hover:text-red-400 transition-colors"
-                    >
-                      ❌ Dismiss
-                    </button>
-                  </div>
+                    ← Back to query detail
+                  </Link>
                 </div>
               </Section>
             )}

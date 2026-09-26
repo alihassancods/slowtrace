@@ -7,6 +7,7 @@ import ConnectionLostCard from '@/components/ConnectionLostCard'
 import ErrorCard from '@/components/ErrorCard'
 import { Skeleton, SkeletonText } from '@/components/Skeleton'
 import { friendlyError, isConnectionError } from '@/lib/errors'
+import { useActiveConnection } from '@/lib/activeConnection'
 
 // ---------------------------------------------------------------------------
 // SQL syntax highlighter (token-based, no external lib)
@@ -318,7 +319,8 @@ export default function QueryDetailPage() {
     id: legacyId,
   } = useParams<{ connectionId?: string; queryid?: string; id?: string }>()
 
-  const connectionId = connectionIdParam ?? ''
+  const activeConnection = useActiveConnection()
+  const connectionId = connectionIdParam ?? activeConnection?.id ?? ''
   const queryid = queryidParam ?? legacyId ?? ''
 
   const navigate = useNavigate()
