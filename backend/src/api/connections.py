@@ -15,7 +15,7 @@ from typing import Any
 import asyncpg
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from api.store import CONNECTIONS
 
@@ -30,6 +30,18 @@ router = APIRouter()
 class ConnectionTestRequest(BaseModel):
     connection_string: str
     nickname: str = ""
+
+    @field_validator("connection_string")
+    @classmethod
+    def validate_connection_string(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) > 2048:
+            raise ValueError("Connection string is too long (max 2048 characters).")
+        if not v.startswith(("postgresql://", "postgres://")):
+            raise ValueError(
+                "Connection string must start with 'postgresql://' or 'postgres://'."
+            )
+        return v
 
 
 # ---------------------------------------------------------------------------

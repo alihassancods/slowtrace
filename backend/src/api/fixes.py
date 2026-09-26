@@ -107,16 +107,22 @@ async def _connect(dsn: str) -> asyncpg.Connection:
     """Open a connection or raise HTTPException on failure."""
     try:
         return await asyncio.wait_for(asyncpg.connect(dsn=dsn), timeout=5)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Database connection failed: {exc}")
+    except asyncpg.InvalidPasswordError:
+        raise HTTPException(status_code=502, detail="Database authentication failed.")
+    except asyncpg.InvalidCatalogNameError:
+        raise HTTPException(status_code=502, detail="Database not found.")
+    except OSError:
+        raise HTTPException(status_code=502, detail="Database host not reachable.")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Database connection failed.")
 
 
 async def _fetch_query_row(conn: asyncpg.Connection, queryid: str) -> dict[str, Any]:
     """Fetch one row from pg_stat_statements or raise 404."""
     try:
         row = await asyncio.wait_for(conn.fetchrow(_FETCH_SINGLE_SQL, queryid), timeout=10)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Query fetch failed: {exc}")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Failed to fetch query statistics.")
     if row is None:
         raise HTTPException(status_code=404, detail="Query ID not found in pg_stat_statements.")
     return dict(row)
@@ -224,8 +230,8 @@ async def _apply_stream(
 
     try:
         conn: asyncpg.Connection = await asyncio.wait_for(asyncpg.connect(dsn=dsn), timeout=5)
-    except Exception as exc:
-        yield _sse("error", {"message": f"Database connection failed: {exc}"})
+    except Exception:
+        yield _sse("error", {"message": "Database connection failed."})
         return
 
     try:
@@ -294,10 +300,11 @@ async def rollback_fix(body: RollbackRequest) -> RollbackResponse:
 
 @router.get("/fixes/history/{connection_id}")
 async def get_fix_history(connection_id: str) -> list[dict[str, Any]]:
-    """Return list of applied fixes (from the JSON history file) for this connection."""
+    """Return list of applied fixes for this connection_id only."""
     if connection_id not in CONNECTIONS:
         raise HTTPException(status_code=404, detail="Connection ID not found.")
-    # The history file is keyed by fix_id, not connection_id, so we return all
-    # records (the connection_id is not stored per-fix in the current executor).
-    # Future improvement: tag each record with connection_id at execution time.
-    return _load_history()
+    history = _load_history()
+    # Return only records belonging to this connection_id; fall back to all
+    # records if none are tagged (backwards-compatible with older entries).
+    scoped = [r for r in history if r.get("connection_id") == connection_id]
+    return scoped if scoped else [r for r in history if "connection_id" not in r]

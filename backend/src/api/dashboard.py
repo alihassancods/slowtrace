@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from urllib.parse import unquote
 
 from fastapi import APIRouter
@@ -114,10 +115,16 @@ def _build_query_summary(report: QueryReport) -> QuerySummary:
 # ---------------------------------------------------------------------------
 
 
+def _redact_dsn(dsn: str) -> str:
+    """Replace the password in a DSN with '***' so it is safe to return to callers."""
+    return re.sub(r"(://[^:@/]*:)[^@/]+(@)", r"\1***\2", dsn)
+
+
 @router.get("/{connection_id:path}")
 async def get_dashboard(connection_id: str) -> DashboardReport:
     """Fan out to health + queries in parallel, aggregate, and return."""
     dsn = unquote(connection_id)
+    safe_id = _redact_dsn(dsn)
     errors: list[DashboardError] = []
 
     health_result, query_result = await asyncio.gather(
@@ -138,4 +145,4 @@ async def get_dashboard(connection_id: str) -> DashboardReport:
     else:
         queries = _build_query_summary(query_result)
 
-    return DashboardReport(connection_id=dsn, health=health, queries=queries, errors=errors)
+    return DashboardReport(connection_id=safe_id, health=health, queries=queries, errors=errors)

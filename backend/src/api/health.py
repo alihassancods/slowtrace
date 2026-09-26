@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncGenerator
 from typing import Any
 from urllib.parse import unquote
@@ -561,6 +562,11 @@ async def _run_health_stream(dsn: str) -> AsyncGenerator[str, None]:
 # ---------------------------------------------------------------------------
 
 
+def _redact_dsn(dsn: str) -> str:
+    """Replace the password in a DSN with '***' so it is safe to return to callers."""
+    return re.sub(r"(://[^:@/]*:)[^@/]+(@)", r"\1***\2", dsn)
+
+
 @router.get("/{connection_id:path}/stream")
 async def stream_health(connection_id: str) -> StreamingResponse:
     """Stream health check results as Server-Sent Events."""
@@ -579,6 +585,7 @@ async def stream_health(connection_id: str) -> StreamingResponse:
 async def get_health(connection_id: str) -> HealthReport:
     """Return a complete health report as JSON (runs all checks sequentially)."""
     dsn = unquote(connection_id)
+    safe_id = _redact_dsn(dsn)
     checks: list[CheckResult] = []
     errors: list[HealthError] = []
 
@@ -586,7 +593,7 @@ async def get_health(connection_id: str) -> HealthReport:
     if conn is None:
         errors.append(HealthError(check="connect", message=data.get("message", "")))
         return HealthReport(
-            connection_id=dsn,
+            connection_id=safe_id,
             score=None,
             grade=None,
             checks=[],
@@ -608,7 +615,7 @@ async def get_health(connection_id: str) -> HealthReport:
         cr.deduction = deduction_map.get(cr.name, 0)
 
     return HealthReport(
-        connection_id=dsn,
+        connection_id=safe_id,
         score=score,
         grade=grade,
         checks=checks,

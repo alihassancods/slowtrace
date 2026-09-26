@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 
 import uuid
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from api.store import CONNECTIONS
 
@@ -386,6 +386,18 @@ async def _run_scan(dsn: str) -> AsyncGenerator[str, None]:
 
 class _RegisterRequest(BaseModel):
     connection_string: str
+
+    @field_validator("connection_string")
+    @classmethod
+    def validate_connection_string(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) > 2048:
+            raise ValueError("Connection string is too long (max 2048 characters).")
+        if not v.startswith(("postgresql://", "postgres://")):
+            raise ValueError(
+                "Connection string must start with 'postgresql://' or 'postgres://'."
+            )
+        return v
 
 
 class _RegisterResponse(BaseModel):

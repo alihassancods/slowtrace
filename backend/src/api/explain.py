@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 from urllib.parse import unquote
 
@@ -145,10 +146,16 @@ async def _step_explain(
 # ---------------------------------------------------------------------------
 
 
+def _redact_dsn(dsn: str) -> str:
+    """Replace the password in a DSN with '***' so it is safe to return to callers."""
+    return re.sub(r"(://[^:@/]*:)[^@/]+(@)", r"\1***\2", dsn)
+
+
 @router.get("/{connection_id:path}/{queryid}")
 async def get_explain(connection_id: str, queryid: str) -> QueryDetail:
     """Return single-query stats and EXPLAIN plan as one JSON response."""
     dsn = unquote(connection_id)
+    safe_id = _redact_dsn(dsn)
     errors: list[ExplainError] = []
 
     # Step 1 — connect
@@ -156,7 +163,7 @@ async def get_explain(connection_id: str, queryid: str) -> QueryDetail:
     if conn is None:
         errors.append(ExplainError(step="connect", message=data.get("message", "")))
         return QueryDetail(
-            connection_id=dsn,
+            connection_id=safe_id,
             queryid=queryid,
             query=None,
             query_fingerprint=None,
@@ -183,7 +190,7 @@ async def get_explain(connection_id: str, queryid: str) -> QueryDetail:
                 msg = "Query ID not found in pg_stat_statements."
             errors.append(ExplainError(step="fetch_query", message=msg))
             return QueryDetail(
-                connection_id=dsn,
+                connection_id=safe_id,
                 queryid=queryid,
                 query=None,
                 query_fingerprint=None,
@@ -221,7 +228,7 @@ async def get_explain(connection_id: str, queryid: str) -> QueryDetail:
     )
 
     return QueryDetail(
-        connection_id=dsn,
+        connection_id=safe_id,
         queryid=queryid,
         query=row["query"],
         query_fingerprint=_fingerprint(row["query"]),

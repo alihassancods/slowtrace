@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import unquote
 
@@ -269,10 +270,16 @@ def _analyse(row: dict[str, Any], plan: list[dict[str, Any]] | None) -> list[Fix
 # ---------------------------------------------------------------------------
 
 
+def _redact_dsn(dsn: str) -> str:
+    """Replace the password in a DSN with '***' so it is safe to return to callers."""
+    return re.sub(r"(://[^:@/]*:)[^@/]+(@)", r"\1***\2", dsn)
+
+
 @router.get("/{connection_id:path}/{queryid}")
 async def get_fix(connection_id: str, queryid: str) -> FixReport:
     """Return ranked fix recommendations for a single slow query."""
     dsn = unquote(connection_id)
+    safe_id = _redact_dsn(dsn)
     errors: list[FixError] = []
 
     # Step 1 — connect
@@ -280,7 +287,7 @@ async def get_fix(connection_id: str, queryid: str) -> FixReport:
     if conn is None:
         errors.append(FixError(step="connect", message=data.get("message", "")))
         return FixReport(
-            connection_id=dsn,
+            connection_id=safe_id,
             queryid=queryid,
             query_fingerprint=None,
             score=None,
@@ -301,7 +308,7 @@ async def get_fix(connection_id: str, queryid: str) -> FixReport:
                 msg = "Query ID not found in pg_stat_statements."
             errors.append(FixError(step="fetch_query", message=msg))
             return FixReport(
-                connection_id=dsn,
+                connection_id=safe_id,
                 queryid=queryid,
                 query_fingerprint=None,
                 score=None,
@@ -334,7 +341,7 @@ async def get_fix(connection_id: str, queryid: str) -> FixReport:
     recommendations = _analyse(row, plan)
 
     return FixReport(
-        connection_id=dsn,
+        connection_id=safe_id,
         queryid=queryid,
         query_fingerprint=_fingerprint(row["query"]) if row.get("query") else None,
         score=score,
