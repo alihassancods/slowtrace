@@ -5,6 +5,7 @@ import DashboardPage from '@/pages/DashboardPage'
 import QueryDetailPage from '@/pages/QueryDetailPage'
 import FixPage from '@/pages/FixPage'
 import WizardPage from '@/pages/WizardPage'
+import FixResultPage from '@/pages/FixResultPage'
 
 const navLinks = [
   { to: '/', label: 'Home', end: true },
@@ -45,10 +46,16 @@ export default function App() {
           <Routes>
             <Route path="/" element={<WelcomePage />} />
             <Route path="/scan" element={<ScanPage />} />
+            <Route path="/scan/:id" element={<ScanPage />} />
             <Route path="/dashboard" element={<DashboardPage />} />
+            <Route path="/dashboard/:id" element={<DashboardPage />} />
             <Route path="/dashboard/query/:id" element={<QueryDetailPage />} />
+            <Route path="/query/:connectionId/:queryid" element={<QueryDetailPage />} />
             <Route path="/fix/:id" element={<FixPage />} />
+            <Route path="/fix/:connectionId/:queryid" element={<FixPage />} />
             <Route path="/wizard" element={<WizardPage />} />
+            <Route path="/wizard/:id" element={<WizardPage />} />
+            <Route path="/result/:fixId" element={<FixResultPage />} />
           </Routes>
         </main>
       </div>

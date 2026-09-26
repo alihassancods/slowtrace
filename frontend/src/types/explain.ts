@@ -30,5 +30,7 @@ export interface QueryDetail {
   cache_hit_ratio: number | null
   score: number | null
   plan: Record<string, unknown>[] | null
+  is_traced: boolean
+  code_location: string | null
   errors: ExplainError[]
 }

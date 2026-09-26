@@ -11,6 +11,8 @@ export interface SlowQuery {
   shared_blks_read: number
   cache_hit_ratio: number
   score: number
+  is_traced: boolean
+  code_location: string | null
 }
 
 export interface ScanError {

@@ -22,3 +22,31 @@ export interface FixReport {
   recommendations: FixRecommendation[]
   errors: FixError[]
 }
+
+export type FixStatus = 'success' | 'auto_rolled_back' | 'failed'
+
+/** Normalised result handed from FixPage → FixResultPage via router state. */
+export interface FixResultState {
+  status: FixStatus
+  connectionId: string
+  queryid: string
+  // success
+  health_before?: number
+  health_after?: number
+  health_improvement?: number
+  query_time_before_ms?: number
+  query_time_after_ms?: number
+  speedup_factor?: number
+  time_saved_per_day_minutes?: number
+  can_rollback?: boolean
+  rollback_available_until?: string
+  // auto_rolled_back
+  reason?: string
+  // failed
+  error?: string
+}
+
+export interface RollbackResponse {
+  status: string
+  message: string
+}

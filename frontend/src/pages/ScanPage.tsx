@@ -1,107 +1,510 @@
-import { useState } from 'react'
-import { useQueryScan } from '@/hooks/useQueryScan'
-import ScanProgress from '@/components/ScanProgress'
-import QueryTable from '@/components/QueryTable'
+import { useEffect, useRef, useState } from 'react'
+import { useNavigate, useParams, Link } from 'react-router-dom'
+import ConnectionLostCard from '@/components/ConnectionLostCard'
+import EmptyState from '@/components/EmptyState'
+import ErrorCard from '@/components/ErrorCard'
+import { Skeleton } from '@/components/Skeleton'
 
-export default function ScanPage() {
-  const [dsn, setDsn] = useState('')
-  const { state, steps, queries, start, reset } = useQueryScan()
+// ---------------------------------------------------------------------------
+// Types matching the SSE envelope from GET /api/scan/{connection_id}
+// ---------------------------------------------------------------------------
 
-  function handleScan(e: React.FormEvent) {
-    e.preventDefault()
-    if (dsn.trim()) {
-      localStorage.setItem('slowtrace_dsn', dsn.trim())
-      start(dsn.trim())
-    }
+interface ConnectedData {
+  version?: string
+  size?: string
+  table_count?: number
+  total_rows?: number
+  error?: string
+}
+
+interface HealthCheckData {
+  check: string
+  status: 'ok' | 'warning' | 'fail'
+  message?: string
+  [key: string]: unknown
+}
+
+interface SlowQueriesData {
+  queries: unknown[]
+  total_wasted_minutes: number
+  human_description: string
+}
+
+interface CompleteData {
+  health_score: number
+  critical_count: number
+  warning_count: number
+  healthy_count: number
+  quick_wins: { check: string; fix: string }[]
+}
+
+type SseStage = 'connected' | 'health_check' | 'slow_queries' | 'complete'
+
+interface SseEvent {
+  stage: SseStage
+  data: Record<string, unknown>
+}
+
+// ---------------------------------------------------------------------------
+// Total event count used to drive the progress bar.
+// 1 connected + 8 health_checks + 1 slow_queries + 1 complete = 11
+// ---------------------------------------------------------------------------
+const TOTAL_EVENTS = 11
+
+// Friendly display names for health check keys
+const CHECK_LABELS: Record<string, string> = {
+  connections: 'Open connections',
+  cache_hit_ratio: 'Cache hit ratio',
+  replication_lag: 'Replication lag',
+  table_bloat: 'Table bloat',
+  lock_contention: 'Lock contention',
+  long_transactions: 'Long-running transactions',
+  index_usage: 'Index usage',
+  dead_tuples: 'Dead tuples (autovacuum)',
+}
+
+function checkLabel(key: string): string {
+  return CHECK_LABELS[key] ?? key.replace(/_/g, ' ')
+}
+
+function formatRows(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+function ProgressBar({ pct }: { pct: number }) {
+  return (
+    <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-700">
+      <div
+        className="absolute inset-y-0 left-0 rounded-full bg-indigo-500 transition-all duration-500 ease-out"
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  )
+}
+
+function ConnectedCard({ data }: { data: ConnectedData }) {
+  if (data.error) {
+    return (
+      <div className="rounded-xl border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-300">
+        Connection error: {data.error}
+      </div>
+    )
   }
-
-  const scanning = state === 'scanning'
+  // Extract short version string e.g. "PostgreSQL 15.3 on …" → "15.3"
+  const versionShort = data.version
+    ? (data.version.match(/PostgreSQL\s+([\d.]+)/i)?.[1] ?? data.version.split(' ')[1] ?? data.version)
+    : '—'
 
   return (
-    <div className="p-8 max-w-5xl mx-auto">
-      <h1 className="text-3xl font-bold mb-2">Slow Query Analysis</h1>
-      <p className="text-slate-400 mb-8">
-        Connect to a PostgreSQL database and scan for slow queries via{' '}
-        <code className="text-indigo-400">pg_stat_statements</code>.
-      </p>
+    <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+      <h2 className="mb-3 text-sm font-semibold uppercase tracking-widest text-slate-400">
+        Database
+      </h2>
+      <ul className="space-y-2 text-sm text-slate-200">
+        <li className="flex items-center gap-2">
+          <span>✅</span>
+          <span>PostgreSQL {versionShort}</span>
+        </li>
+        <li className="flex items-center gap-2">
+          <span>📦</span>
+          <span>{data.size ?? '—'} database</span>
+        </li>
+        <li className="flex items-center gap-2">
+          <span>📋</span>
+          <span>{data.table_count ?? 0} tables discovered</span>
+        </li>
+        <li className="flex items-center gap-2">
+          <span>👥</span>
+          <span>{formatRows(data.total_rows ?? 0)} total rows</span>
+        </li>
+      </ul>
+    </div>
+  )
+}
 
-      {/* DSN input — always visible unless scanning */}
-      {state !== 'scanning' && (
-        <form onSubmit={handleScan} className="mb-8 flex gap-3">
-          <input
-            type="text"
-            value={dsn}
-            onChange={(e) => setDsn(e.target.value)}
-            placeholder="postgresql://user:pass@host:5432/dbname"
-            disabled={scanning}
-            className="flex-1 rounded-lg border border-slate-600 bg-slate-800 px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-50"
-          />
-          <button
-            type="submit"
-            disabled={scanning || !dsn.trim()}
-            className="rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Scan
-          </button>
-          {(state === 'done' || state === 'error') && (
-            <button
-              type="button"
-              onClick={reset}
-              className="rounded-lg border border-slate-600 px-5 py-2.5 text-sm font-semibold text-slate-300 transition-colors hover:border-slate-400 hover:text-white"
-            >
-              Reset
-            </button>
-          )}
-        </form>
-      )}
+function HealthRow({ check, index }: { check: HealthCheckData; index: number }) {
+  const icon = check.status === 'ok' ? '✅' : check.status === 'warning' ? '⚠️' : '🔴'
+  const valueColor =
+    check.status === 'ok'
+      ? 'text-emerald-400'
+      : check.status === 'warning'
+        ? 'text-yellow-400'
+        : 'text-red-400'
 
-      {/* Scanning state: show progress + cancel */}
-      {state === 'scanning' && (
-        <div className="mb-8">
-          <div className="mb-4 flex items-center justify-between">
-            <p className="text-sm text-slate-400">
-              Scanning <span className="font-mono text-indigo-400">{dsn}</span>…
-            </p>
-            <button
-              type="button"
-              onClick={reset}
-              className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
-            >
-              Cancel
-            </button>
-          </div>
-          <ScanProgress steps={steps} scanning={scanning} />
-        </div>
-      )}
+  const value = check.message ?? check.status
 
-      {/* Progress shown after scan too (collapsed) */}
-      {(state === 'done' || state === 'error') && steps.length > 0 && (
-        <div className="mb-8">
-          <ScanProgress steps={steps} scanning={false} />
-        </div>
-      )}
+  return (
+    <li
+      className="flex items-start gap-3 text-sm opacity-0"
+      style={{
+        animation: `slideFadeIn 0.3s ease-out ${index * 0.15}s forwards`,
+      }}
+    >
+      <span className="mt-0.5 shrink-0 text-base leading-none">{icon}</span>
+      <span className="min-w-0 flex-1 text-slate-300">{checkLabel(check.check)}</span>
+      <span className={`shrink-0 text-right font-medium ${valueColor}`}>{value}</span>
+    </li>
+  )
+}
 
-      {/* Results table */}
-      {state === 'done' && (
+function SlowQueriesCard({ data }: { data: SlowQueriesData }) {
+  const count = data.queries.length
+  const minutes = data.total_wasted_minutes
+
+  const wastedText =
+    minutes >= 60
+      ? `${(minutes / 60).toFixed(1)}h wasted today`
+      : minutes >= 1
+        ? `${minutes.toFixed(1)} min wasted today`
+        : `${(minutes * 60).toFixed(0)}s wasted today`
+
+  return (
+    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-5">
+      <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="text-base font-semibold text-amber-300">
+          🐌 {count} slow {count === 1 ? 'query' : 'queries'} found
+        </span>
+        <span className="text-sm font-medium text-amber-400">💸 {wastedText}</span>
+      </div>
+      <p className="text-sm leading-relaxed text-slate-300">{data.human_description}</p>
+    </div>
+  )
+}
+
+function CompleteCard({ data }: { data: CompleteData }) {
+  const scoreColor =
+    data.health_score >= 80
+      ? 'text-emerald-400'
+      : data.health_score >= 50
+        ? 'text-yellow-400'
+        : 'text-red-400'
+
+  return (
+    <div className="rounded-xl border border-indigo-500/40 bg-indigo-500/10 p-5">
+      <div className="mb-4 flex flex-wrap items-center gap-4">
         <div>
-          <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-lg font-semibold">
-              Results —{' '}
-              <span className="text-indigo-400">{queries.length}</span> slow{' '}
-              {queries.length === 1 ? 'query' : 'queries'}
-            </h2>
-            <span className="text-xs text-slate-500">Sorted by score · click a row for details</span>
-          </div>
-          <QueryTable queries={queries} />
+          <span className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+            Health score
+          </span>
+          <p className={`text-3xl font-extrabold ${scoreColor}`}>{data.health_score}</p>
         </div>
-      )}
+        <div className="flex gap-4 text-sm">
+          <span className="text-emerald-400">✅ {data.healthy_count} healthy</span>
+          {data.warning_count > 0 && (
+            <span className="text-yellow-400">⚠️ {data.warning_count} warnings</span>
+          )}
+          {data.critical_count > 0 && (
+            <span className="text-red-400">🔴 {data.critical_count} critical</span>
+          )}
+        </div>
+      </div>
 
-      {/* Error state */}
-      {state === 'error' && (
-        <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-300">
-          Scan failed. Check the connection string and try again.
+      {data.quick_wins.length > 0 && (
+        <div>
+          <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-slate-400">
+            Quick wins
+          </p>
+          <ul className="space-y-1.5">
+            {data.quick_wins.map((w) => (
+              <li key={w.check} className="text-sm text-slate-300">
+                <span className="font-medium text-indigo-300">{checkLabel(w.check)}: </span>
+                {w.fix}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Loading skeleton
+// ---------------------------------------------------------------------------
+
+function ScanSkeleton() {
+  return (
+    <div className="space-y-5" aria-busy="true" aria-label="Scanning database">
+      {/* Database card */}
+      <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+        <Skeleton className="h-3 w-24" />
+        <div className="mt-4 space-y-3">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="flex items-center gap-3">
+              <Skeleton className="h-4 w-4 shrink-0 rounded-full" />
+              <Skeleton className="h-3 w-full max-w-xs" />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Health checks card */}
+      <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+        <Skeleton className="h-3 w-28" />
+        <div className="mt-4 space-y-3">
+          {[0, 1, 2, 3, 4, 5].map((i) => (
+            <div key={i} className="flex items-center justify-between gap-4">
+              <Skeleton className="h-3 w-48" />
+              <Skeleton className="h-3 w-20" />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main page
+// ---------------------------------------------------------------------------
+
+export default function ScanPage() {
+  const { id: connectionId } = useParams<{ id: string }>()
+  const navigate = useNavigate()
+
+  // Phase tracking
+  const [phase, setPhase] = useState<'connecting' | 'scanning' | 'done' | 'error'>(
+    connectionId ? 'connecting' : 'idle' as never,
+  )
+  const [progress, setProgress] = useState(0)
+  const [errorKind, setErrorKind] = useState<'connection' | 'error' | null>(null)
+  const [attempt, setAttempt] = useState(0)
+
+  // Received data
+  const [connectedData, setConnectedData] = useState<ConnectedData | null>(null)
+  const [healthChecks, setHealthChecks] = useState<HealthCheckData[]>([])
+  const [slowQueriesData, setSlowQueriesData] = useState<SlowQueriesData | null>(null)
+  const [completeData, setCompleteData] = useState<CompleteData | null>(null)
+
+  // Nickname from location state (passed by WelcomePage — optional)
+  const [nickname] = useState<string>(() => {
+    try {
+      return (history.state as { usr?: { nickname?: string } })?.usr?.nickname ?? ''
+    } catch {
+      return ''
+    }
+  })
+
+  const eventsReceived = useRef(0)
+  const esRef = useRef<EventSource | null>(null)
+
+  useEffect(() => {
+    // If no connectionId, this is the legacy /scan route — nothing to stream
+    if (!connectionId) {
+      setPhase('idle' as never)
+      return
+    }
+
+    setPhase('connecting')
+    setProgress(0)
+    setErrorKind(null)
+    setConnectedData(null)
+    setHealthChecks([])
+    setSlowQueriesData(null)
+    setCompleteData(null)
+    eventsReceived.current = 0
+
+    let finished = false
+    const es = new EventSource(`/api/scan/${connectionId}`)
+    esRef.current = es
+
+    function bump() {
+      eventsReceived.current += 1
+      // Cap at TOTAL_EVENTS - 1 so complete event can push to 100
+      const pct = Math.min(
+        Math.round((eventsReceived.current / TOTAL_EVENTS) * 100),
+        99,
+      )
+      setProgress(pct)
+    }
+
+    es.onmessage = (e: MessageEvent) => {
+      let parsed: SseEvent
+      try {
+        parsed = JSON.parse(e.data) as SseEvent
+      } catch {
+        return
+      }
+
+      setPhase('scanning')
+      bump()
+
+      const { stage, data } = parsed
+
+      if (stage === 'connected') {
+        setConnectedData(data as ConnectedData)
+        if ((data as ConnectedData).error) {
+          finished = true
+          setErrorKind('connection')
+          setPhase('error')
+          es.close()
+        }
+      } else if (stage === 'health_check') {
+        setHealthChecks((prev) => [...prev, data as HealthCheckData])
+      } else if (stage === 'slow_queries') {
+        setSlowQueriesData(data as unknown as SlowQueriesData)
+      } else if (stage === 'complete') {
+        setCompleteData(data as unknown as CompleteData)
+        setProgress(100)
+        setPhase('done')
+        finished = true
+        es.close()
+        // Navigate to dashboard after 1 second
+        setTimeout(() => {
+          navigate(`/dashboard/${connectionId}`)
+        }, 1000)
+      }
+    }
+
+    es.onerror = () => {
+      if (!finished) {
+        setErrorKind('error')
+        setPhase('error')
+      }
+      es.close()
+    }
+
+    return () => {
+      es.close()
+      esRef.current = null
+    }
+  }, [connectionId, attempt, navigate])
+
+  // ── No connectionId: legacy scan page shell ─────────────────────────────
+  if (!connectionId) {
+    return (
+      <div className="p-8 max-w-2xl mx-auto">
+        <h1 className="text-2xl font-bold mb-2">Database Scan</h1>
+        <p className="text-slate-400">
+          Connect from the{' '}
+          <a href="/" className="text-indigo-400 hover:underline">
+            home page
+          </a>{' '}
+          to start a scan.
+        </p>
+      </div>
+    )
+  }
+
+  const headingText =
+    phase === 'connecting'
+      ? 'Connecting…'
+      : phase === 'done'
+        ? 'Scan complete!'
+        : phase === 'error'
+          ? 'Scan stopped'
+          : `Scanning${nickname ? ` ${nickname}` : ''}…`
+
+  const hasData =
+    Boolean(connectedData) || healthChecks.length > 0 || Boolean(slowQueriesData)
+  const showSkeleton = phase === 'connecting' || (phase === 'scanning' && !hasData)
+
+  return (
+    <>
+      {/* Keyframe animation injected once */}
+      <style>{`
+        @keyframes slideFadeIn {
+          from { opacity: 0; transform: translateX(-12px); }
+          to   { opacity: 1; transform: translateX(0); }
+        }
+      `}</style>
+
+      <div className="mx-auto max-w-2xl px-4 py-10">
+        {/* Back to dashboard */}
+        <Link
+          to={`/dashboard/${connectionId}`}
+          className="mb-4 inline-flex items-center gap-1 text-sm text-indigo-400 transition-colors hover:text-indigo-300"
+        >
+          ← Back to Dashboard
+        </Link>
+
+        {/* Header */}
+        <div className="mb-6">
+          <h1 className="text-2xl font-bold text-white">
+            {headingText}
+          </h1>
+          {phase === 'scanning' && (
+            <p className="mt-1 text-sm text-slate-400">
+              Analysing your database health in real time…
+            </p>
+          )}
+        </div>
+
+        {/* Progress bar */}
+        <div className="mb-8">
+          <ProgressBar pct={progress} />
+          <p className="mt-1.5 text-right text-xs text-slate-500">{progress}%</p>
+        </div>
+
+        {/* Skeleton — shown until the first results arrive */}
+        {showSkeleton && (
+          <div className="mb-5">
+            <ScanSkeleton />
+          </div>
+        )}
+
+        {/* Error states */}
+        {phase === 'error' && (
+          <div className="mb-5">
+            {errorKind === 'connection' ? (
+              <ConnectionLostCard onReconnect={() => navigate('/')} />
+            ) : (
+              <ErrorCard
+                title="Could not finish the scan"
+                message="The scan stopped before it finished. Check that your database is reachable, then try again."
+                onRetry={() => setAttempt((n) => n + 1)}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Streaming results */}
+        <div className="space-y-5">
+          {/* Connected card */}
+          {connectedData && <ConnectedCard data={connectedData} />}
+
+          {/* Health checks */}
+          {healthChecks.length > 0 && (
+            <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+              <h2 className="mb-4 text-sm font-semibold uppercase tracking-widest text-slate-400">
+                Health checks
+              </h2>
+              <ul className="space-y-3">
+                {healthChecks.map((check, i) => (
+                  <HealthRow key={`${check.check}-${i}`} check={check} index={i} />
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Slow queries */}
+          {slowQueriesData &&
+            (slowQueriesData.queries.length === 0 ? (
+              <EmptyState
+                icon="🎉"
+                title="🎉 No slow queries detected! Your database is performing well."
+              />
+            ) : (
+              <SlowQueriesCard data={slowQueriesData} />
+            ))}
+
+          {/* Complete */}
+          {completeData && <CompleteCard data={completeData} />}
+
+          {/* Done banner */}
+          {phase === 'done' && (
+            <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-5 py-3 text-sm font-medium text-emerald-300">
+              ✅ Scan complete — redirecting to dashboard…
+            </div>
+          )}
+        </div>
+      </div>
+    </>
   )
 }

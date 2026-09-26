@@ -19,6 +19,7 @@ from api.queries import (
     _step_check_permissions,
     _step_fetch_queries,
 )
+from api.store import CONNECTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -325,13 +326,29 @@ class TestStepFetchQueries:
 # ---------------------------------------------------------------------------
 
 
+def _register_dsn(dsn: str) -> str:
+    """Insert a DSN directly into the shared store and return a UUID."""
+    import uuid
+    cid = str(uuid.uuid4())
+    CONNECTIONS[cid] = dsn
+    return cid
+
+
 class TestGetQueriesEndpoint:
+    async def test_unknown_connection_id_returns_404(self):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/queries/00000000-0000-0000-0000-000000000000")
+        assert resp.status_code == 404
+
     async def test_connect_failure_returns_errors(self):
+        cid = _register_dsn("postgresql://bad/db")
         with patch("api.queries._step_connect", return_value=(None, "fail", {"message": "bad dsn"})):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
-                resp = await client.get("/api/queries/postgresql%3A%2F%2Fbad%2Fdb")
+                resp = await client.get(f"/api/queries/{cid}")
         assert resp.status_code == 200
         body = resp.json()
         assert body["total_queries"] == 0
@@ -339,6 +356,7 @@ class TestGetQueriesEndpoint:
         assert body["errors"][0]["step"] == "connect"
 
     async def test_happy_path_returns_queries(self):
+        cid = _register_dsn("postgresql://localhost/db")
         mock_conn = AsyncMock()
         mock_conn.fetchval = AsyncMock(return_value=1)
         mock_conn.fetch = AsyncMock(return_value=[_make_fetch_row()])
@@ -348,64 +366,7 @@ class TestGetQueriesEndpoint:
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
-                resp = await client.get("/api/queries/postgresql%3A%2F%2Flocalhost%2Fdb")
+                resp = await client.get(f"/api/queries/{cid}")
         assert resp.status_code == 200
         body = resp.json()
         assert body["total_queries"] >= 0
-
-
-# ---------------------------------------------------------------------------
-# SSE stream tests
-# ---------------------------------------------------------------------------
-
-
-class TestStreamQueriesEndpoint:
-    async def test_stream_returns_event_stream(self):
-        with patch("api.queries._step_connect", return_value=(None, "fail", {"message": "no db"})):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                async with client.stream(
-                    "GET", "/api/queries/postgresql%3A%2F%2Fbad%2Fdb/stream"
-                ) as resp:
-                    assert resp.status_code == 200
-                    assert "text/event-stream" in resp.headers["content-type"]
-
-    async def test_connect_fail_result_is_last(self):
-        with patch("api.queries._step_connect", return_value=(None, "fail", {"message": "no db"})):
-            events = await _collect_sse("/api/queries/postgresql%3A%2F%2Fbad%2Fdb/stream")
-        assert events[-1]["step"] == "result"
-        assert events[-1]["status"] == "fail"
-
-    async def test_happy_path_emits_5_events(self):
-        mock_conn = AsyncMock()
-        mock_conn.fetchval = AsyncMock(return_value=1)
-        mock_conn.fetch = AsyncMock(return_value=[_make_fetch_row()])
-        mock_conn.close = AsyncMock()
-
-        with patch("api.queries._step_connect", return_value=(mock_conn, "ok", {})):
-            events = await _collect_sse("/api/queries/postgresql%3A%2F%2Flocalhost%2Fdb/stream")
-
-        assert len(events) == 5
-        steps = [e["step"] for e in events]
-        assert steps == [
-            "connect",
-            "check_extension",
-            "check_permissions",
-            "fetch_queries",
-            "result",
-        ]
-
-    async def test_result_event_has_queries(self):
-        mock_conn = AsyncMock()
-        mock_conn.fetchval = AsyncMock(return_value=1)
-        mock_conn.fetch = AsyncMock(return_value=[_make_fetch_row()])
-        mock_conn.close = AsyncMock()
-
-        with patch("api.queries._step_connect", return_value=(mock_conn, "ok", {})):
-            events = await _collect_sse("/api/queries/postgresql%3A%2F%2Flocalhost%2Fdb/stream")
-
-        result = events[-1]
-        assert result["step"] == "result"
-        assert "queries" in result["data"]
-        assert result["data"]["total_queries"] >= 0

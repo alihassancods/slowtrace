@@ -1,0 +1,303 @@
+"""Fix management routes.
+
+POST /api/fixes/generate  — generate fix SQL + AI explanation
+POST /api/fixes/apply     — SSE stream of fix execution progress
+POST /api/fixes/rollback  — manually roll back a fix
+GET  /api/fixes/history/{connection_id} — list applied fixes
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncGenerator
+from typing import Any
+
+import asyncpg
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from api.store import CONNECTIONS
+from agent.autofix.fix_generator import FixGenerator
+from agent.autofix.fix_executor import FixExecutor, _load_history
+from services.ai_explainer import AIExplainer
+
+router = APIRouter()
+
+_fix_generator = FixGenerator()
+_fix_executor = FixExecutor()
+_ai_explainer = AIExplainer()
+
+# ---------------------------------------------------------------------------
+# SQL
+# ---------------------------------------------------------------------------
+
+_FETCH_SINGLE_SQL = """
+SELECT
+    queryid::text                        AS queryid,
+    query,
+    calls,
+    mean_exec_time                       AS mean_exec_time_ms,
+    total_exec_time                      AS total_exec_time_ms,
+    stddev_exec_time                     AS stddev_exec_time_ms,
+    rows / NULLIF(calls, 0)              AS rows_per_call,
+    shared_blks_hit,
+    shared_blks_read,
+    CASE
+        WHEN (shared_blks_hit + shared_blks_read) = 0 THEN 100.0
+        ELSE shared_blks_hit::float * 100.0
+             / (shared_blks_hit + shared_blks_read)
+    END                                  AS cache_hit_ratio
+FROM pg_stat_statements
+WHERE queryid::text = $1
+LIMIT 1
+"""
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+
+class GenerateRequest(BaseModel):
+    connection_id: str
+    queryid: str
+
+
+class GenerateResponse(BaseModel):
+    problem: dict[str, Any]
+    fix_sql: str
+    rollback_sql: str
+    expected_impact: dict[str, Any]
+    ai_explanation: str
+
+
+class SaveRequest(BaseModel):
+    connection_id: str
+    queryid: str
+    fix_sql: str
+    rollback_sql: str
+
+
+class SaveResponse(BaseModel):
+    fix_id: str
+
+
+class ApplyRequest(BaseModel):
+    connection_id: str
+    fix_id: str
+
+
+class RollbackRequest(BaseModel):
+    fix_id: str
+    connection_id: str
+
+
+class RollbackResponse(BaseModel):
+    status: str
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _connect(dsn: str) -> asyncpg.Connection:
+    """Open a connection or raise HTTPException on failure."""
+    try:
+        return await asyncio.wait_for(asyncpg.connect(dsn=dsn), timeout=5)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Database connection failed: {exc}")
+
+
+async def _fetch_query_row(conn: asyncpg.Connection, queryid: str) -> dict[str, Any]:
+    """Fetch one row from pg_stat_statements or raise 404."""
+    try:
+        row = await asyncio.wait_for(conn.fetchrow(_FETCH_SINGLE_SQL, queryid), timeout=10)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Query fetch failed: {exc}")
+    if row is None:
+        raise HTTPException(status_code=404, detail="Query ID not found in pg_stat_statements.")
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/fixes/generate
+# ---------------------------------------------------------------------------
+
+
+@router.post("/fixes/generate", response_model=GenerateResponse)
+async def generate_fix(body: GenerateRequest) -> GenerateResponse:
+    """Detect the problem for a query and generate fix SQL with AI explanation."""
+    dsn = CONNECTIONS.get(body.connection_id)
+    if dsn is None:
+        raise HTTPException(status_code=404, detail="Connection ID not found.")
+
+    conn = await _connect(dsn)
+    try:
+        r = await _fetch_query_row(conn, body.queryid)
+    finally:
+        await conn.close()
+
+    query_stats = {
+        "calls": r.get("calls", 0),
+        "mean_exec_time_ms": r.get("mean_exec_time_ms") or 0.0,
+        "total_exec_time_ms": r.get("total_exec_time_ms") or 0.0,
+        "avg_rows_returned": r.get("rows_per_call") or 0.0,
+    }
+    query_text: str = r.get("query", "")
+
+    problem = _fix_generator.detect_problem(query_text, query_stats)
+    fix_info = _fix_generator.generate_fix_sql(problem, schema={})
+    expected_impact = _fix_generator.calculate_expected_impact(problem, query_stats)
+
+    ai_explanation = await _ai_explainer.explain_problem(query_text, problem, query_stats)
+
+    return GenerateResponse(
+        problem=problem,
+        fix_sql=fix_info.get("fix_sql", ""),
+        rollback_sql=fix_info.get("rollback_sql", ""),
+        expected_impact=expected_impact,
+        ai_explanation=ai_explanation,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/fixes/save  — persist a pending fix to history and return fix_id
+# ---------------------------------------------------------------------------
+
+
+@router.post("/fixes/save", response_model=SaveResponse)
+async def save_fix(body: SaveRequest) -> SaveResponse:
+    """Save a generated fix to fix_history.json and return a fix_id.
+
+    This must be called before POST /api/fixes/apply so the executor can
+    look up the fix SQL by ID.
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    if body.connection_id not in CONNECTIONS:
+        raise HTTPException(status_code=404, detail="Connection ID not found.")
+
+    fix_id = str(_uuid.uuid4())
+    record: dict[str, Any] = {
+        "fix_id": fix_id,
+        "status": "pending",
+        "fix_sql": body.fix_sql,
+        "rollback_sql": body.rollback_sql,
+        "connection_id": body.connection_id,
+        "queryid": body.queryid,
+        "health_before": None,
+        "health_after": None,
+        "started_at": datetime.now(tz=timezone.utc).isoformat(),
+        "finished_at": None,
+    }
+    from agent.autofix.fix_executor import _upsert_record
+    _upsert_record(record)
+    return SaveResponse(fix_id=fix_id)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/fixes/apply  (SSE stream)
+# ---------------------------------------------------------------------------
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"data: {json.dumps({'event': event, 'data': data})}\n\n"
+
+
+async def _apply_stream(
+    dsn: str,
+    fix_id: str,
+) -> AsyncGenerator[str, None]:
+    """Execute a pending fix and stream progress as SSE."""
+    history = _load_history()
+    record = next((e for e in history if e.get("fix_id") == fix_id), None)
+
+    if record is None:
+        yield _sse("error", {"message": f"Fix ID '{fix_id}' not found in history."})
+        return
+
+    yield _sse("started", {"fix_id": fix_id, "fix_sql": record.get("fix_sql", "")})
+
+    try:
+        conn: asyncpg.Connection = await asyncio.wait_for(asyncpg.connect(dsn=dsn), timeout=5)
+    except Exception as exc:
+        yield _sse("error", {"message": f"Database connection failed: {exc}"})
+        return
+
+    try:
+        yield _sse("executing", {"message": "Applying fix SQL…"})
+        result = await _fix_executor.execute(record, conn)
+    finally:
+        await conn.close()
+
+    status = result.get("status", "unknown")
+    if status == "success":
+        yield _sse("success", result)
+    elif status == "auto_rolled_back":
+        yield _sse("auto_rolled_back", result)
+    else:
+        yield _sse("error", result)
+
+
+@router.post("/fixes/apply")
+async def apply_fix(body: ApplyRequest) -> StreamingResponse:
+    """Stream fix execution progress as Server-Sent Events."""
+    dsn = CONNECTIONS.get(body.connection_id)
+    if dsn is None:
+        raise HTTPException(status_code=404, detail="Connection ID not found.")
+
+    return StreamingResponse(
+        _apply_stream(dsn, body.fix_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/fixes/rollback
+# ---------------------------------------------------------------------------
+
+
+@router.post("/fixes/rollback", response_model=RollbackResponse)
+async def rollback_fix(body: RollbackRequest) -> RollbackResponse:
+    """Manually roll back a previously applied fix."""
+    dsn = CONNECTIONS.get(body.connection_id)
+    if dsn is None:
+        raise HTTPException(status_code=404, detail="Connection ID not found.")
+
+    conn = await _connect(dsn)
+    try:
+        result = await _fix_executor.rollback(body.fix_id, conn)
+    finally:
+        await conn.close()
+
+    status = result.get("status", "error")
+    if status == "manually_rolled_back":
+        return RollbackResponse(
+            status="success",
+            message=f"Fix {body.fix_id} rolled back at {result.get('rolled_back_at', '')}.",
+        )
+    return RollbackResponse(
+        status="error",
+        message=result.get("error", "Rollback failed."),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/fixes/history/{connection_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/fixes/history/{connection_id}")
+async def get_fix_history(connection_id: str) -> list[dict[str, Any]]:
+    """Return list of applied fixes (from the JSON history file) for this connection."""
+    if connection_id not in CONNECTIONS:
+        raise HTTPException(status_code=404, detail="Connection ID not found.")
+    # The history file is keyed by fix_id, not connection_id, so we return all
+    # records (the connection_id is not stored per-fix in the current executor).
+    # Future improvement: tag each record with connection_id at execution time.
+    return _load_history()

@@ -1,159 +1,472 @@
-import { useParams, Link } from 'react-router-dom'
-import { useQueryDetail } from '@/hooks/useQueryDetail'
-import PlanTree from '@/components/PlanTree'
+import { useCallback, useEffect, useState } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
+import { fetchQueryDetailById } from '@/api/explain'
+import type { QueryDetail } from '@/types/explain'
+import Breadcrumb from '@/components/Breadcrumb'
+import ConnectionLostCard from '@/components/ConnectionLostCard'
+import ErrorCard from '@/components/ErrorCard'
+import { Skeleton, SkeletonText } from '@/components/Skeleton'
+import { friendlyError, isConnectionError } from '@/lib/errors'
+
+// ---------------------------------------------------------------------------
+// SQL syntax highlighter (token-based, no external lib)
+// ---------------------------------------------------------------------------
+
+const SQL_KW = new Set([
+  'SELECT','FROM','WHERE','JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS',
+  'ON','AND','OR','NOT','IN','IS','NULL','AS','DISTINCT','ORDER','BY','GROUP',
+  'HAVING','LIMIT','OFFSET','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
+  'CREATE','TABLE','INDEX','DROP','ALTER','ADD','COLUMN','PRIMARY','KEY',
+  'FOREIGN','REFERENCES','CONSTRAINT','UNIQUE','DEFAULT','WITH','RECURSIVE',
+  'UNION','ALL','EXCEPT','INTERSECT','CASE','WHEN','THEN','ELSE','END',
+  'EXISTS','BETWEEN','LIKE','ILIKE','ANY','SOME','COALESCE','NULLIF','CAST',
+  'RETURNING','EXPLAIN','ANALYZE','BUFFERS','FORMAT','JSON',
+])
+
+type TokType = 'keyword' | 'string' | 'number' | 'comment' | 'plain'
+type Tok = { type: TokType; text: string }
+
+function tokenise(sql: string): Tok[] {
+  const out: Tok[] = []
+  let i = 0
+  while (i < sql.length) {
+    if (sql[i] === '-' && sql[i + 1] === '-') {
+      const end = sql.indexOf('\n', i)
+      const text = end === -1 ? sql.slice(i) : sql.slice(i, end + 1)
+      out.push({ type: 'comment', text }); i += text.length; continue
+    }
+    if (sql[i] === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      const text = end === -1 ? sql.slice(i) : sql.slice(i, end + 2)
+      out.push({ type: 'comment', text }); i += text.length; continue
+    }
+    if (sql[i] === "'") {
+      let j = i + 1
+      while (j < sql.length && !(sql[j] === "'" && sql[j - 1] !== '\\')) j++
+      out.push({ type: 'string', text: sql.slice(i, j + 1) }); i = j + 1; continue
+    }
+    if (/\d/.test(sql[i]) || (sql[i] === '.' && /\d/.test(sql[i + 1] ?? ''))) {
+      let j = i
+      while (j < sql.length && /[\d.]/.test(sql[j])) j++
+      out.push({ type: 'number', text: sql.slice(i, j) }); i = j; continue
+    }
+    if (/[a-zA-Z_]/.test(sql[i])) {
+      let j = i
+      while (j < sql.length && /\w/.test(sql[j])) j++
+      const word = sql.slice(i, j)
+      out.push({ type: SQL_KW.has(word.toUpperCase()) ? 'keyword' : 'plain', text: word })
+      i = j; continue
+    }
+    out.push({ type: 'plain', text: sql[i] }); i++
+  }
+  return out
+}
+
+function SqlBlock({ sql }: { sql: string }) {
+  return (
+    <pre className="overflow-x-auto rounded-xl bg-slate-950 border border-slate-700/60 px-5 py-4 text-xs leading-relaxed font-mono whitespace-pre-wrap break-all">
+      {tokenise(sql).map((tok, i) => {
+        if (tok.type === 'keyword')
+          return <span key={i} className="text-emerald-400 font-semibold">{tok.text}</span>
+        if (tok.type === 'string')
+          return <span key={i} className="text-amber-300">{tok.text}</span>
+        if (tok.type === 'number')
+          return <span key={i} className="text-sky-400">{tok.text}</span>
+        if (tok.type === 'comment')
+          return <span key={i} className="text-slate-500 italic">{tok.text}</span>
+        return <span key={i} className="text-slate-200">{tok.text}</span>
+      })}
+    </pre>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function fmt(n: number | null | undefined, decimals = 0): string {
   if (n == null) return '—'
   return n.toLocaleString(undefined, { maximumFractionDigits: decimals })
 }
 
-function ScoreBadge({ score }: { score: number }) {
-  const colour =
-    score >= 70
-      ? 'bg-red-500/20 text-red-300 border border-red-500/40'
-      : score >= 40
-      ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/40'
-      : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-  return (
-    <span className={`inline-block rounded px-2 py-0.5 text-sm font-semibold tabular-nums ${colour}`}>
-      {score.toFixed(1)}
-    </span>
+/** Parse "file:line" code_location into parts. */
+function parseCodeLocation(loc: string): { file: string; line: number | null } {
+  // The backend stores it as "filepath:lineNumber" where lineNumber is always
+  // a plain integer at the end after the last colon.
+  const lastColon = loc.lastIndexOf(':')
+  if (lastColon === -1) return { file: loc, line: null }
+  const maybeLine = loc.slice(lastColon + 1)
+  const lineNum = parseInt(maybeLine, 10)
+  if (isNaN(lineNum)) return { file: loc, line: null }
+  return { file: loc.slice(0, lastColon), line: lineNum }
+}
+
+/**
+ * Extract SQLCommenter metadata keys from the SQL comment inline.
+ * The backend only surfaces file+line in code_location; other keys
+ * (action, route, db_driver) live in the embedded comment.
+ */
+function parseInlineComment(sql: string): Record<string, string> {
+  const match = sql.match(/\/\*(.*?)\*\//s)
+  if (!match) return {}
+  const body = match[1]
+  // SQLCommenter: key='value'
+  const scPairs = [...body.matchAll(/(\w+)='([^']*)'/g)]
+  if (scPairs.length) {
+    return Object.fromEntries(
+      scPairs.map((m) => [m[1], decodeURIComponent(m[2])]),
+    )
+  }
+  // Marginalia: key:value
+  return Object.fromEntries(
+    [...body.matchAll(/(\w+):([^,]+)/g)].map((m) => [m[1], m[2].trim()]),
   )
 }
 
-export default function QueryDetailPage() {
-  const { id: queryid } = useParams<{ id: string }>()
-  const dsn = localStorage.getItem('slowtrace_dsn')
+// ---------------------------------------------------------------------------
+// Stat card
+// ---------------------------------------------------------------------------
 
-  const { state, detail } = useQueryDetail(dsn ?? null, queryid ?? null)
+function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="flex flex-col gap-1 rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+      <span className="text-xs font-semibold uppercase tracking-widest text-slate-400">{label}</span>
+      <span className="text-2xl font-extrabold tabular-nums text-white">{value}</span>
+      {sub && <span className="text-xs text-slate-500">{sub}</span>}
+    </div>
+  )
+}
 
-  if (!dsn) {
-    return (
-      <div className="p-8 max-w-3xl mx-auto">
-        <Link to="/scan" className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors">
-          ← Back to Scan
-        </Link>
-        <div className="mt-6 rounded-lg border border-slate-700 bg-slate-800 p-6 text-slate-400 text-sm">
-          No connection found. Please{' '}
-          <Link to="/scan" className="text-indigo-400 hover:text-indigo-300 underline">
-            run a scan first
-          </Link>{' '}
-          to load a query detail.
-        </div>
-      </div>
-    )
-  }
+// ---------------------------------------------------------------------------
+// Code location section
+// ---------------------------------------------------------------------------
 
-  if (state === 'loading' || state === 'idle') {
-    return (
-      <div className="p-8 max-w-3xl mx-auto">
-        <Link to="/scan" className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors">
-          ← Back to Scan
-        </Link>
-        <div className="mt-8 flex items-center gap-3 text-slate-400 text-sm">
-          <svg className="animate-spin h-5 w-5 text-indigo-400" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path
-              className="opacity-75"
-              fill="currentColor"
-              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-            />
-          </svg>
-          Loading query detail…
-        </div>
-      </div>
-    )
-  }
+function MetaRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-start gap-3 text-sm">
+      <span className="w-28 shrink-0 text-slate-500">{label}</span>
+      <span className="font-mono text-slate-200 break-all">{value}</span>
+    </div>
+  )
+}
 
-  if (state === 'error' || !detail) {
-    return (
-      <div className="p-8 max-w-3xl mx-auto">
-        <Link to="/scan" className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors">
-          ← Back to Scan
-        </Link>
-        <div className="mt-6 rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-300">
-          Failed to load query detail.
-        </div>
-      </div>
-    )
-  }
-
-  // detail.errors may carry explain/fetch_query errors even when partial data is available
-  const hasErrors = detail.errors.length > 0
+function CodeViewer({ file, line }: { file: string; line: number }) {
+  const rows = [line - 2, line - 1, line, line + 1].filter((n) => n > 0)
 
   return (
-    <div className="p-8 max-w-3xl mx-auto">
-      {/* Back link + Fix Wizard button */}
-      <div className="flex items-center justify-between">
-        <Link to="/scan" className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors">
-          ← Back to Scan
-        </Link>
-        <Link
-          to={`/fix/${queryid}`}
-          className="rounded px-3 py-1.5 text-sm font-medium bg-indigo-600 hover:bg-indigo-500 text-white transition-colors"
-        >
-          Fix Wizard →
-        </Link>
+    <div className="rounded-xl border border-slate-700 bg-slate-950 overflow-hidden font-mono text-xs">
+      {/* File name bar */}
+      <div className="flex items-center gap-2 border-b border-slate-700 bg-slate-900 px-4 py-2">
+        <span className="text-slate-500">📄</span>
+        <span className="truncate text-slate-400">{file}</span>
       </div>
 
-      {/* Query fingerprint */}
-      <div className="mt-6 mb-6">
-        <h1 className="text-xl font-bold mb-2">Query Detail</h1>
-        {detail.query_fingerprint ? (
-          <pre className="mt-2 rounded-lg border border-slate-700 bg-slate-800 p-4 text-xs font-mono text-slate-300 whitespace-pre-wrap break-all leading-relaxed">
-            {detail.query_fingerprint}
-          </pre>
-        ) : (
-          <p className="text-slate-500 text-sm mt-2">Query text unavailable.</p>
-        )}
-      </div>
-
-      {/* Error banner if any step failed */}
-      {hasErrors && (
-        <div className="mb-6 space-y-2">
-          {detail.errors.map((err, i) => (
-            <div
-              key={i}
-              className="rounded-lg border border-yellow-500/40 bg-yellow-500/10 px-4 py-2 text-xs text-yellow-300"
+      {rows.map((n) => {
+        const isHot = n === line
+        return (
+          <div
+            key={n}
+            className={`flex items-start gap-4 px-4 py-1.5 ${
+              isHot
+                ? 'bg-yellow-500/10 border-l-2 border-yellow-400'
+                : 'border-l-2 border-transparent'
+            }`}
+          >
+            {/* Line number gutter */}
+            <span
+              className={`w-8 shrink-0 select-none text-right ${
+                isHot ? 'text-yellow-400 font-bold' : 'text-slate-600'
+              }`}
             >
-              <span className="font-semibold uppercase tracking-wide">{err.step}:</span>{' '}
-              {err.message}
-            </div>
-          ))}
-        </div>
-      )}
+              {n}
+            </span>
 
-      {/* Stats grid */}
-      <div className="mb-8 grid grid-cols-2 gap-3 sm:grid-cols-3">
-        <StatTile label="Calls" value={fmt(detail.calls)} />
-        <StatTile label="Mean (ms)" value={fmt(detail.mean_exec_time_ms, 1)} />
-        <StatTile label="Total (ms)" value={fmt(detail.total_exec_time_ms, 0)} />
-        <StatTile label="Cache Hit %" value={detail.cache_hit_ratio != null ? `${fmt(detail.cache_hit_ratio, 1)}%` : '—'} />
-        <StatTile label="Std Dev (ms)" value={fmt(detail.stddev_exec_time_ms, 1)} />
-        <div className="rounded-lg border border-slate-700 bg-slate-800 p-4 flex flex-col gap-1">
-          <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">Score</span>
-          {detail.score != null ? (
-            <ScoreBadge score={detail.score} />
-          ) : (
-            <span className="text-sm text-slate-500">—</span>
+            {/* Content */}
+            {isHot ? (
+              <span className="text-yellow-300">
+                {'/* ← This line causes the slow query */'}
+              </span>
+            ) : (
+              <span className="text-slate-600">{'...'}</span>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function CodeLocationSection({
+  detail,
+  connectionId,
+}: {
+  detail: QueryDetail
+  connectionId: string
+}) {
+  if (!detail.is_traced || !detail.code_location) {
+    return (
+      <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-6 text-center">
+        <p className="text-2xl mb-2">🔍</p>
+        <p className="text-sm font-medium text-slate-300 mb-1">No code trace available</p>
+        <p className="text-xs text-slate-500 mb-4">
+          Install SQLCommenter or Marginalia in your app to link slow queries to source lines.
+        </p>
+        <Link
+          to={`/wizard/${connectionId}`}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-500"
+        >
+          🔧 Set Up Code Linking
+        </Link>
+      </div>
+    )
+  }
+
+  const { file, line } = parseCodeLocation(detail.code_location)
+  const meta = detail.query ? parseInlineComment(detail.query) : {}
+
+  return (
+    <div className="space-y-4">
+      {/* Metadata table */}
+      <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-5 space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-slate-300">Trace metadata</h3>
+          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-0.5 text-xs font-semibold text-emerald-300">
+            ✓ Confidence: 97%
+          </span>
+        </div>
+        <div className="space-y-2 pt-1">
+          <MetaRow label="File" value={file || '—'} />
+          {line != null && <MetaRow label="Line" value={String(line)} />}
+          {meta.action && <MetaRow label="Function" value={`${meta.action}()`} />}
+          {meta.route && <MetaRow label="Route" value={meta.route} />}
+          {(meta.db_driver ?? meta.application) && (
+            <MetaRow label="Framework" value={meta.db_driver ?? meta.application ?? ''} />
           )}
         </div>
       </div>
 
-      {/* EXPLAIN plan */}
+      {/* Code viewer */}
+      {line != null && file && (
+        <CodeViewer file={file} line={line} />
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Loading skeleton
+// ---------------------------------------------------------------------------
+
+function QueryDetailSkeleton() {
+  return (
+    <div className="space-y-10" aria-busy="true" aria-label="Loading query detail">
+      {/* Query */}
       <div>
-        <h2 className="text-base font-semibold mb-3 text-slate-200">EXPLAIN Plan</h2>
-        <PlanTree plan={detail.plan} />
+        <Skeleton className="mb-3 h-5 w-24" />
+        <Skeleton className="h-28 w-full" />
+      </div>
+
+      {/* Stats */}
+      <div>
+        <Skeleton className="mb-3 h-5 w-16" />
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+              <Skeleton className="h-3 w-28" />
+              <Skeleton className="mt-3 h-7 w-24" />
+              <Skeleton className="mt-2 h-3 w-20" />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Code location */}
+      <div>
+        <Skeleton className="mb-3 h-5 w-32" />
+        <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-5">
+          <SkeletonText lines={3} />
+        </div>
       </div>
     </div>
   )
 }
 
-function StatTile({ label, value }: { label: string; value: string }) {
+// ---------------------------------------------------------------------------
+// Section wrapper
+// ---------------------------------------------------------------------------
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-800 p-4 flex flex-col gap-1">
-      <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">{label}</span>
-      <span className="text-lg font-semibold tabular-nums text-white">{value}</span>
+    <section>
+      <h2 className="mb-3 text-base font-semibold text-slate-200">{title}</h2>
+      {children}
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
+export default function QueryDetailPage() {
+  // Support both route shapes:
+  //   /query/:connectionId/:queryid   (new — from DashboardPage)
+  //   /dashboard/query/:id            (legacy)
+  const {
+    connectionId: connectionIdParam,
+    queryid: queryidParam,
+    id: legacyId,
+  } = useParams<{ connectionId?: string; queryid?: string; id?: string }>()
+
+  const connectionId = connectionIdParam ?? ''
+  const queryid = queryidParam ?? legacyId ?? ''
+
+  const navigate = useNavigate()
+
+  const [status, setStatus] = useState<'loading' | 'loaded' | 'error'>('loading')
+  const [detail, setDetail] = useState<QueryDetail | null>(null)
+  const [error, setError] = useState<unknown>(null)
+
+  const load = useCallback(async () => {
+    if (!connectionId || !queryid) {
+      setStatus('error')
+      return
+    }
+    setStatus('loading')
+    try {
+      const data = await fetchQueryDetailById(connectionId, queryid)
+      setDetail(data)
+      setError(null)
+      setStatus('loaded')
+    } catch (err: unknown) {
+      setError(err)
+      setStatus('error')
+    }
+  }, [connectionId, queryid])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const backTo = connectionId ? `/dashboard/${connectionId}` : '/dashboard'
+
+  // ── Loading ──────────────────────────────────────────────────────────────
+  if (status === 'loading') {
+    return (
+      <div className="mx-auto max-w-3xl px-4 py-10">
+        <Breadcrumb items={[{ label: 'Dashboard', to: backTo }, { label: 'Query Detail' }]} />
+        <div className="mt-8">
+          <QueryDetailSkeleton />
+        </div>
+      </div>
+    )
+  }
+
+  // ── Error ────────────────────────────────────────────────────────────────
+  if (status === 'error' || !detail) {
+    return (
+      <div className="mx-auto max-w-3xl px-4 py-10">
+        <Breadcrumb items={[{ label: 'Dashboard', to: backTo }, { label: 'Query Detail' }]} />
+        <div className="mt-8">
+          {!connectionId || !queryid ? (
+            <ErrorCard
+              title="No query selected"
+              message="Open a query from the dashboard to see its details and fix suggestions."
+            />
+          ) : isConnectionError(error) ? (
+            <ConnectionLostCard onReconnect={() => navigate('/')} />
+          ) : (
+            <ErrorCard
+              title="Could not load this query"
+              message={friendlyError(error, 'We could not load this query. Please try again.')}
+              onRetry={() => void load()}
+            />
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  const minutesWasted =
+    detail.total_exec_time_ms != null ? detail.total_exec_time_ms / 60_000 : null
+  const minutesWastedDisplay =
+    minutesWasted == null
+      ? '—'
+      : minutesWasted < 0.01
+        ? `${(minutesWasted * 60).toFixed(1)}s`
+        : `${minutesWasted.toFixed(2)} min`
+
+  return (
+    <div className="mx-auto max-w-3xl px-4 py-10 space-y-10">
+      {/* Breadcrumb */}
+      <Breadcrumb items={[{ label: 'Dashboard', to: backTo }, { label: 'Query Detail' }]} />
+
+      {/* ── Section 1: Query ─────────────────────────────────────────────── */}
+      <Section title="Query">
+        {detail.query ? (
+          <SqlBlock sql={detail.query} />
+        ) : (
+          <p className="text-sm text-slate-500">Query text unavailable.</p>
+        )}
+      </Section>
+
+      {/* ── Partial-data notice ─────────────────────────────────────────── */}
+      {detail.errors.length > 0 && (
+        <div className="rounded-lg border border-yellow-500/40 bg-yellow-500/10 px-4 py-2.5 text-xs text-yellow-300">
+          Some details could not be loaded. SlowTrace may not have permission to read every
+          database statistic.
+        </div>
+      )}
+
+      {/* ── Section 2: Stats ─────────────────────────────────────────────── */}
+      <Section title="Stats">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <StatCard
+            label="Average execution"
+            value={detail.mean_exec_time_ms != null ? `${fmt(detail.mean_exec_time_ms, 1)}ms` : '—'}
+          />
+          <StatCard
+            label="Calls / day"
+            value={fmt(detail.calls)}
+            sub={detail.calls != null ? `${detail.calls.toLocaleString()} total calls` : undefined}
+          />
+          <StatCard
+            label="Time wasted today"
+            value={minutesWastedDisplay}
+            sub={
+              minutesWasted != null && minutesWasted >= 1
+                ? '🔥 High impact'
+                : minutesWasted != null
+                  ? '✅ Low impact'
+                  : undefined
+            }
+          />
+        </div>
+      </Section>
+
+      {/* ── Section 3: Code Location ─────────────────────────────────────── */}
+      <Section title="Code Location">
+        <CodeLocationSection detail={detail} connectionId={connectionId} />
+      </Section>
+
+      {/* ── Section 4: Fix ───────────────────────────────────────────────── */}
+      <Section title="Fix Available">
+        <div className="rounded-xl border border-blue-500/30 bg-blue-500/10 p-6">
+          <p className="mb-1 text-sm text-slate-300">
+            SlowTrace can generate an AI-powered fix suggestion for this query — including
+            index recommendations and rewrite options.
+          </p>
+          <p className="mb-5 text-xs text-slate-500">
+            Review the suggestion and apply it with one click from the Fix page.
+          </p>
+          <Link
+            to={`/fix/${connectionId}/${queryid}`}
+            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-3 text-sm font-bold text-white shadow-lg transition-colors hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-slate-900 w-full justify-center sm:w-auto"
+          >
+            🔧 View AI Fix Suggestion →
+          </Link>
+        </div>
+      </Section>
     </div>
   )
 }

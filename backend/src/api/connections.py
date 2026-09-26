@@ -1,9 +1,14 @@
-"""POST /api/connections/test — stream connection-test results via SSE."""
+"""POST /api/connections/test — stream connection-test results via SSE.
+
+On success, stores the DSN in the shared connection registry and includes
+the generated ``connection_id`` in the final ``result`` SSE event.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -12,7 +17,9 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-router = APIRouter(prefix="/api/connections")
+from api.store import CONNECTIONS
+
+router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
@@ -22,6 +29,7 @@ router = APIRouter(prefix="/api/connections")
 
 class ConnectionTestRequest(BaseModel):
     connection_string: str
+    nickname: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +96,6 @@ async def _step_verify_permissions(
         await conn.fetch("SELECT * FROM pg_stat_statements LIMIT 1")
         return "ok", {}
     except asyncpg.InsufficientPrivilegeError:
-        # Extract the username from the connection so the fix hint is concrete.
         try:
             user: str = await conn.fetchval("SELECT current_user")
         except Exception:
@@ -123,7 +130,6 @@ async def _step_db_info(
               AND table_type = 'BASE TABLE'
             """
         )
-        # Summed reltuples is a fast estimate; exact counts require ANALYZE.
         total_rows: int = await conn.fetchval(
             """
             SELECT coalesce(sum(reltuples), 0)::bigint
@@ -148,7 +154,7 @@ async def _step_db_info(
 # ---------------------------------------------------------------------------
 
 
-async def _run_test(dsn: str) -> AsyncGenerator[str, None]:
+async def _run_test(dsn: str, nickname: str) -> AsyncGenerator[str, None]:
     """Yield SSE events for each test step, then a final summary event."""
     steps: list[dict[str, Any]] = []
     db_info: dict[str, Any] = {}
@@ -159,7 +165,6 @@ async def _run_test(dsn: str) -> AsyncGenerator[str, None]:
     yield _event("connect", status, data)
 
     if conn is None:
-        # Cannot proceed without a connection.
         yield _event(
             "result",
             "fail",
@@ -188,13 +193,21 @@ async def _run_test(dsn: str) -> AsyncGenerator[str, None]:
     finally:
         await conn.close()
 
-    # Final summary
+    # Final summary — store connection on overall success
     overall = all(s["status"] in ("ok", "warning") for s in steps)
+
+    connection_id: str | None = None
+    if overall:
+        connection_id = str(uuid.uuid4())
+        CONNECTIONS[connection_id] = dsn
+
     yield _event(
         "result",
         "ok" if overall else "fail",
         {
             "success": overall,
+            "connection_id": connection_id,
+            "nickname": nickname,
             "version": db_info.get("version", ""),
             "size": db_info.get("size", ""),
             "table_count": db_info.get("table_count", 0),
@@ -209,11 +222,15 @@ async def _run_test(dsn: str) -> AsyncGenerator[str, None]:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/test")
+@router.post("/connections/test")
 async def test_connection(body: ConnectionTestRequest) -> StreamingResponse:
-    """Stream connection-test step results as Server-Sent Events."""
+    """Stream connection-test step results as Server-Sent Events.
+
+    On success the final ``result`` event includes a ``connection_id`` that
+    callers must pass to subsequent endpoints.
+    """
     return StreamingResponse(
-        _run_test(body.connection_string),
+        _run_test(body.connection_string, body.nickname),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
