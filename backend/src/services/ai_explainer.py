@@ -16,13 +16,21 @@ import httpx
 # ---------------------------------------------------------------------------
 
 _API_URL = "https://api.deepseek.com/chat/completions"
-_MODEL = "deepseek-chat"
-_MAX_TOKENS = 200
-_TIMEOUT = 15.0  # seconds
+_DEFAULT_MODEL = "deepseek-v4-flash"
+# The default model is a reasoning model: it spends part of the budget on hidden
+# chain-of-thought before emitting the answer. A small cap (200) makes it return
+# an empty `content` with finish_reason="length", which silently degraded every
+# explanation to the canned fallback. Leave room for reasoning + the answer.
+_MAX_TOKENS = 1024
+_TIMEOUT = 30.0  # seconds
 
 
 def _api_key() -> str | None:
     return os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+
+
+def _model() -> str:
+    return os.environ.get("DEEPSEEK_MODEL") or _DEFAULT_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +126,7 @@ async def _chat(system: str, user: str) -> str | None:
         return None
 
     payload = {
-        "model": _MODEL,
+        "model": _model(),
         "max_tokens": _MAX_TOKENS,
         "messages": [
             {"role": "system", "content": system},
@@ -135,7 +143,11 @@ async def _chat(system: str, user: str) -> str | None:
             response = await client.post(_API_URL, json=payload, headers=headers)
             response.raise_for_status()
             data: dict[str, Any] = response.json()
-            return data["choices"][0]["message"]["content"].strip()
+            message = data["choices"][0]["message"]
+            # A reasoning model can return null/empty content when it runs out of
+            # budget; treat that as "no answer" so the caller uses its fallback.
+            content = (message.get("content") or "").strip()
+            return content or None
     except Exception:
         return None
 

@@ -15,7 +15,7 @@ import asyncpg
 # Fix history store  (JSON file, good enough for a hackathon)
 # ---------------------------------------------------------------------------
 
-_HISTORY_PATH = Path(__file__).resolve().parents[4] / "data" / "fix_history.json"
+_HISTORY_PATH = Path(__file__).resolve().parents[3] / "data" / "fix_history.json"
 
 
 def _load_history() -> list[dict[str, Any]]:
@@ -181,7 +181,9 @@ class FixExecutor:
             A result dict whose ``status`` key is one of
             ``"success"``, ``"auto_rolled_back"``, or ``"error"``.
         """
-        fix_id = str(uuid.uuid4())
+        # Reuse the id assigned by POST /api/fixes/save (when present) so the
+        # history entry, rollback and result page all reference the same fix.
+        fix_id = fix.get("fix_id") or str(uuid.uuid4())
         fix_sql: str = fix.get("fix_sql", "")
         rollback_sql: str = fix.get("rollback_sql", "")
         now = datetime.now(tz=timezone.utc)
@@ -190,7 +192,10 @@ class FixExecutor:
         health_before = await _measure_health(conn)
 
         # ── Step 2: write "executing" record ─────────────────────────────────
+        # Start from the incoming record so connection_id/queryid and the
+        # expected impact from generate/save survive into the final entry.
         record: dict[str, Any] = {
+            **fix,
             "fix_id": fix_id,
             "status": "executing",
             "fix_sql": fix_sql,

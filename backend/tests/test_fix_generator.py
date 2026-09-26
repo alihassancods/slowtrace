@@ -9,6 +9,8 @@ from agent.autofix.fix_generator import (
     _extract_from_table,
     _extract_where_columns,
     _has_index,
+    _resolve_filter_table,
+    _table_alias_map,
 )
 
 
@@ -346,3 +348,123 @@ class TestCalculateExpectedImpact:
         )
         assert impact["before_ms"] == 0
         assert impact["after_ms"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Table / column resolution (joins, aliases, quoted identifiers)
+# ---------------------------------------------------------------------------
+
+
+class TestTableAliasMap:
+    def test_join_aliases(self):
+        mapping = _table_alias_map(
+            "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE u.email = $1"
+        )
+        assert mapping["o"] == "orders"
+        assert mapping["u"] == "users"
+        assert mapping["orders"] == "orders"
+        assert mapping["users"] == "users"
+
+    def test_where_is_not_an_alias(self):
+        mapping = _table_alias_map("SELECT id FROM users WHERE email = $1")
+        assert "where" not in mapping
+        assert mapping["users"] == "users"
+
+
+class TestResolveFilterTable:
+    def test_join_qualified_column_belongs_to_joined_table(self):
+        table, columns = _resolve_filter_table(
+            "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE u.email = $1"
+        )
+        assert table == "users"
+        assert columns == ["email"]
+
+    def test_table_qualified_column(self):
+        table, columns = _resolve_filter_table(
+            "SELECT 1 FROM orders WHERE orders.customer_id = $1"
+        )
+        assert table == "orders"
+        assert columns == ["customer_id"]
+
+    def test_unqualified_single_table(self):
+        table, columns = _resolve_filter_table("SELECT 1 FROM users WHERE email = $1")
+        assert table == "users"
+        assert columns == ["email"]
+
+    def test_quoted_identifiers(self):
+        table, columns = _resolve_filter_table(
+            'SELECT "o"."id" FROM "public"."orders" "o" WHERE "o"."customer_id" = $1'
+        )
+        assert table == "orders"
+        assert columns == ["customer_id"]
+
+    def test_update_statement_table(self):
+        table, columns = _resolve_filter_table(
+            "UPDATE orders SET status = $1 WHERE customer_id = $2"
+        )
+        assert table == "orders"
+        assert columns == ["customer_id"]
+
+    def test_no_where_returns_none(self):
+        assert _resolve_filter_table("SELECT * FROM users") == (None, [])
+
+
+class TestDetectProblemJoins:
+    def setup_method(self):
+        self.fg = FixGenerator()
+
+    def test_join_index_targets_filter_table_not_from_table(self):
+        """Regression: the filter column belongs to users, not the FROM table."""
+        p = self.fg.detect_problem(
+            "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE u.email = $1",
+            {"calls": 100, "mean_exec_time_ms": 900, "avg_rows_returned": 3},
+        )
+        assert p["type"] == "missing_index"
+        assert p["table"] == "users"
+        assert p["columns"] == ["email"]
+
+    def test_update_statement_gets_table(self):
+        p = self.fg.detect_problem(
+            "UPDATE orders SET status = $1 WHERE customer_id = $2",
+            {"calls": 100, "mean_exec_time_ms": 700},
+        )
+        assert p["type"] == "missing_index"
+        assert p["table"] == "orders"
+
+    def test_existing_index_suppresses_missing_index(self):
+        p = self.fg.detect_problem(
+            "SELECT id FROM users WHERE email = $1",
+            {
+                "calls": 100,
+                "mean_exec_time_ms": 800,
+                "existing_indexes": ["idx_users_email"],
+            },
+        )
+        assert p.get("type") != "missing_index"
+
+    def test_select_star_on_join_uses_from_table(self):
+        p = self.fg.detect_problem(
+            "SELECT * FROM orders o JOIN users u ON u.id = o.user_id WHERE u.email = $1",
+            {"calls": 10, "mean_exec_time_ms": 100, "existing_indexes": ["idx_users_email"]},
+        )
+        assert p["type"] == "select_star"
+        assert p["table"] == "orders"
+
+
+class TestTargetTableMethod:
+    def setup_method(self):
+        self.fg = FixGenerator()
+
+    def test_prefers_filter_table(self):
+        assert (
+            self.fg.target_table(
+                "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE u.email = $1"
+            )
+            == "users"
+        )
+
+    def test_falls_back_to_from_table(self):
+        assert self.fg.target_table("SELECT * FROM orders") == "orders"
+
+    def test_none_for_unparseable(self):
+        assert self.fg.target_table("BEGIN") is None

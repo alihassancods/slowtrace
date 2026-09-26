@@ -292,3 +292,34 @@ class TestExecute:
 
         assert result["status"] == "success"
         assert isinstance(result["index_progress"], list)
+
+    async def test_reuses_saved_fix_id_and_metadata(self, tmp_history):
+        """The id from /fixes/save must survive into the executed history entry."""
+        conn = _make_conn()
+        fix = {
+            **_SIMPLE_FIX,
+            "fix_id": "saved-fix-id",
+            "status": "pending",
+            "connection_id": "conn-1",
+            "queryid": "42",
+        }
+        with patch("agent.autofix.fix_executor._measure_health", return_value=80):
+            result = await FixExecutor().execute(fix, conn)
+
+        assert result["fix_id"] == "saved-fix-id"
+        history = fe._load_history()
+        assert len(history) == 1
+        assert history[0]["fix_id"] == "saved-fix-id"
+        assert history[0]["connection_id"] == "conn-1"
+        assert history[0]["queryid"] == "42"
+        assert history[0]["status"] == "success"
+
+    async def test_impact_metrics_are_surfaced(self, tmp_history):
+        conn = _make_conn()
+        with patch("agent.autofix.fix_executor._measure_health", return_value=80):
+            result = await FixExecutor().execute(_SIMPLE_FIX, conn)
+
+        assert result["query_time_before_ms"] == 1000.0
+        assert result["query_time_after_ms"] == 10.0
+        assert result["speedup_factor"] == pytest.approx(100.0)
+        assert result["time_saved_per_day_minutes"] == pytest.approx(16.5)

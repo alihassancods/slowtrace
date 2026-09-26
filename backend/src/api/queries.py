@@ -182,7 +182,11 @@ LIMIT 1
 async def _step_connect(dsn: str) -> tuple[asyncpg.Connection | None, str, dict[str, Any]]:
     """Open a raw connection with a 5-second timeout."""
     try:
-        conn = await asyncio.wait_for(asyncpg.connect(dsn=dsn), timeout=5)
+        # statement_cache_size=0: PgBouncer transaction poolers (e.g. Supabase
+        # port 6543) cannot support server-side prepared statements.
+        conn = await asyncio.wait_for(
+            asyncpg.connect(dsn=dsn, statement_cache_size=0), timeout=5
+        )
         return conn, "ok", {}
     except asyncio.TimeoutError:
         return None, "fail", {"message": "Connection timed out after 5 seconds."}

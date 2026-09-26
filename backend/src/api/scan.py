@@ -54,7 +54,9 @@ router = APIRouter()
 
 def _sse(stage: str, data: dict[str, Any]) -> str:
     """Format a single SSE line in the expected envelope."""
-    payload = json.dumps({"stage": stage, "data": data})
+    # default=str keeps one exotic column type (Decimal, date, …) from taking
+    # down the whole stream.
+    payload = json.dumps({"stage": stage, "data": data}, default=str)
     return f"data: {payload}\n\n"
 
 
@@ -80,13 +82,15 @@ WHERE c.relkind = 'r'
 
 
 async def _fetch_db_metadata(conn: asyncpg.Connection) -> dict[str, Any]:
-    """Run the 4 metadata queries in parallel and return a combined dict."""
-    version, size, table_count, total_rows = await asyncio.gather(
-        conn.fetchval(_VERSION_SQL),
-        conn.fetchval(_SIZE_SQL),
-        conn.fetchval(_TABLE_COUNT_SQL),
-        conn.fetchval(_TOTAL_ROWS_SQL),
-    )
+    """Run the 4 metadata queries and return a combined dict.
+
+    A single asyncpg connection cannot run concurrent operations, so the
+    queries are issued one after another.
+    """
+    version = await conn.fetchval(_VERSION_SQL)
+    size = await conn.fetchval(_SIZE_SQL)
+    table_count = await conn.fetchval(_TABLE_COUNT_SQL)
+    total_rows = await conn.fetchval(_TOTAL_ROWS_SQL)
     return {
         "version": version,
         "size": size,
@@ -317,8 +321,10 @@ async def _run_scan(dsn: str) -> AsyncGenerator[str, None]:
 
     # ── Connect ──────────────────────────────────────────────────────────────
     try:
+        # statement_cache_size=0: PgBouncer transaction poolers (e.g. Supabase
+        # port 6543) cannot support server-side prepared statements.
         conn: asyncpg.Connection = await asyncio.wait_for(
-            asyncpg.connect(dsn=dsn), timeout=10
+            asyncpg.connect(dsn=dsn, statement_cache_size=0), timeout=10
         )
     except Exception as exc:
         try:
@@ -339,27 +345,15 @@ async def _run_scan(dsn: str) -> AsyncGenerator[str, None]:
         # ── Events 2-9: health_check (stream as each completes) ──────────────
         check_results: list[tuple[str, str, dict[str, Any]]] = []
 
-        # Wrap each check in a named coroutine so we know which check finished.
-        async def _named_check(
-            name: str,
-            check_fn: Any,
-            connection: asyncpg.Connection,
-        ) -> tuple[str, str, dict[str, Any]]:
+        # A single asyncpg connection cannot run concurrent operations, so the
+        # checks run one at a time and each is streamed as it finishes.
+        for name, check_fn in _HEALTH_CHECKS:
             try:
-                status, data = await asyncio.wait_for(check_fn(connection), timeout=10)
+                status, data = await asyncio.wait_for(check_fn(conn), timeout=10)
             except asyncio.TimeoutError:
                 status, data = "fail", {"message": "Check timed out after 10 seconds."}
             except Exception as exc:
                 status, data = "fail", {"message": str(exc)}
-            return name, status, data
-
-        tasks = [
-            asyncio.ensure_future(_named_check(name, fn, conn))
-            for name, fn in _HEALTH_CHECKS
-        ]
-
-        for coro in asyncio.as_completed(tasks):
-            name, status, data = await coro
             check_results.append((name, status, data))
             yield _sse(
                 "health_check",

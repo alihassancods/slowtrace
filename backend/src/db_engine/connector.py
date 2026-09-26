@@ -32,6 +32,9 @@ class DBConnector:
                 dsn=self._dsn,
                 min_size=2,
                 max_size=10,
+                # PgBouncer transaction poolers (e.g. Supabase port 6543) cannot
+                # support server-side prepared statements.
+                statement_cache_size=0,
             )
         except asyncpg.InvalidPasswordError as exc:
             raise ConnectionError(

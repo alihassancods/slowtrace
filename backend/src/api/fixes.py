@@ -54,6 +54,28 @@ WHERE queryid::text = $1
 LIMIT 1
 """
 
+_FETCH_INDEXES_SQL = """
+SELECT indexname
+FROM pg_indexes
+WHERE tablename = $1
+  AND schemaname NOT IN ('pg_catalog', 'information_schema')
+"""
+
+_FETCH_COLUMNS_SQL = """
+SELECT column_name
+FROM information_schema.columns
+WHERE table_name = $1
+  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY ordinal_position
+"""
+
+_FETCH_ROW_ESTIMATE_SQL = """
+SELECT reltuples::bigint
+FROM pg_class
+WHERE relname = $1 AND relkind = 'r'
+LIMIT 1
+"""
+
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
@@ -77,6 +99,11 @@ class SaveRequest(BaseModel):
     queryid: str
     fix_sql: str
     rollback_sql: str
+    # Expected impact from /fixes/generate, so the result page can show real
+    # before/after numbers instead of zeros.
+    query_time_before_ms: float | None = None
+    query_time_after_ms: float | None = None
+    time_saved_per_day_minutes: float | None = None
 
 
 class SaveResponse(BaseModel):
@@ -128,6 +155,41 @@ async def _fetch_query_row(conn: asyncpg.Connection, queryid: str) -> dict[str, 
     return dict(row)
 
 
+async def _introspect_table(
+    conn: asyncpg.Connection, table: str
+) -> tuple[list[str], list[str], int | None]:
+    """Return ``(index_names, columns, row_estimate)`` for *table*.
+
+    Each lookup is best-effort: a permission error on one does not lose the
+    others, and an empty result simply means "no facts to add".
+    """
+    indexes: list[str] = []
+    columns: list[str] = []
+    row_estimate: int | None = None
+
+    try:
+        rows = await asyncio.wait_for(conn.fetch(_FETCH_INDEXES_SQL, table), timeout=10)
+        indexes = [r["indexname"] for r in rows]
+    except Exception:
+        pass
+
+    try:
+        rows = await asyncio.wait_for(conn.fetch(_FETCH_COLUMNS_SQL, table), timeout=10)
+        columns = [r["column_name"] for r in rows]
+    except Exception:
+        pass
+
+    try:
+        value = await asyncio.wait_for(
+            conn.fetchval(_FETCH_ROW_ESTIMATE_SQL, table), timeout=10
+        )
+        row_estimate = int(value) if value is not None else None
+    except Exception:
+        pass
+
+    return indexes, columns, row_estimate
+
+
 # ---------------------------------------------------------------------------
 # POST /api/fixes/generate
 # ---------------------------------------------------------------------------
@@ -143,19 +205,33 @@ async def generate_fix(body: GenerateRequest) -> GenerateResponse:
     conn = await _connect(dsn)
     try:
         r = await _fetch_query_row(conn, body.queryid)
+        query_text: str = r.get("query", "")
+        query_stats = {
+            "calls": r.get("calls", 0),
+            "mean_exec_time_ms": r.get("mean_exec_time_ms") or 0.0,
+            "total_exec_time_ms": r.get("total_exec_time_ms") or 0.0,
+            "avg_rows_returned": r.get("rows_per_call") or 0.0,
+        }
+
+        # Enrich detection with facts from the live database so we never suggest
+        # an index that already exists, and can list real columns for SELECT *.
+        table = _fix_generator.target_table(query_text)
+        schema: dict[str, Any] = {"columns": {}}
+        table_row_counts: dict[str, int] = {}
+        if table:
+            existing_indexes, columns, row_estimate = await _introspect_table(conn, table)
+            query_stats["existing_indexes"] = existing_indexes
+            if columns:
+                schema["columns"][table] = columns
+            if row_estimate is not None:
+                table_row_counts[table] = row_estimate
     finally:
         await conn.close()
 
-    query_stats = {
-        "calls": r.get("calls", 0),
-        "mean_exec_time_ms": r.get("mean_exec_time_ms") or 0.0,
-        "total_exec_time_ms": r.get("total_exec_time_ms") or 0.0,
-        "avg_rows_returned": r.get("rows_per_call") or 0.0,
-    }
-    query_text: str = r.get("query", "")
+    query_stats["table_row_counts"] = table_row_counts
 
     problem = _fix_generator.detect_problem(query_text, query_stats)
-    fix_info = _fix_generator.generate_fix_sql(problem, schema={})
+    fix_info = _fix_generator.generate_fix_sql(problem, schema)
     expected_impact = _fix_generator.calculate_expected_impact(problem, query_stats)
 
     ai_explanation = await _ai_explainer.explain_problem(query_text, problem, query_stats)
@@ -195,6 +271,9 @@ async def save_fix(body: SaveRequest) -> SaveResponse:
         "rollback_sql": body.rollback_sql,
         "connection_id": body.connection_id,
         "queryid": body.queryid,
+        "query_time_before_ms": body.query_time_before_ms or 0.0,
+        "query_time_after_ms": body.query_time_after_ms or 0.0,
+        "time_saved_per_day_minutes": body.time_saved_per_day_minutes or 0.0,
         "health_before": None,
         "health_after": None,
         "started_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -211,7 +290,9 @@ async def save_fix(body: SaveRequest) -> SaveResponse:
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
-    return f"data: {json.dumps({'event': event, 'data': data})}\n\n"
+    # default=str keeps one exotic column type (Decimal, date, …) from taking
+    # down the whole stream.
+    return f"data: {json.dumps({'event': event, 'data': data}, default=str)}\n\n"
 
 
 async def _apply_stream(

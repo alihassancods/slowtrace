@@ -31,17 +31,23 @@ class FixGenerator:
         mean_exec_ms: float = float(query_stats.get("mean_exec_time_ms", 0))
         avg_rows: float = float(query_stats.get("avg_rows_returned", 0))
         table_row_counts: dict[str, int] = query_stats.get("table_row_counts", {})
+        existing_indexes: list[str] = query_stats.get("existing_indexes", [])
 
-        upper = query.upper()
+        # The table a statement reads/writes, and the table that owns the WHERE
+        # columns. These differ for joins: `... FROM orders o JOIN users u
+        # WHERE u.email = $1` must index users(email), not orders(email).
+        from_table = _extract_target_table(query)
+        filter_table, where_cols = _resolve_filter_table(query)
 
         # Pattern 1 — Missing index
-        table = _extract_from_table(query)
-        where_cols = _extract_where_columns(query)
-        existing_indexes: list[str] = query_stats.get("existing_indexes", [])
-        if table and where_cols and not _has_index(table, where_cols, existing_indexes):
+        if (
+            filter_table
+            and where_cols
+            and not _has_index(filter_table, where_cols, existing_indexes)
+        ):
             return {
                 "type": "missing_index",
-                "table": table,
+                "table": filter_table,
                 "columns": where_cols,
             }
 
@@ -49,7 +55,7 @@ class FixGenerator:
         if re.search(r"SELECT\s+\*", query, re.IGNORECASE):
             return {
                 "type": "select_star",
-                "table": table,
+                "table": from_table or filter_table,
             }
 
         # Pattern 3 — N+1 query
@@ -69,17 +75,26 @@ class FixGenerator:
             }
 
         # Pattern 5 — Sequential scan on large table
-        if table:
-            row_count: int = table_row_counts.get(table, 0)
+        if from_table:
+            row_count: int = table_row_counts.get(from_table, 0)
             if row_count > 10_000:
                 return {
                     "type": "seq_scan",
-                    "table": table,
+                    "table": from_table,
                     "table_row_count": row_count,
                     "columns": where_cols,
                 }
 
         return {}
+
+    def target_table(self, query: str) -> str | None:
+        """Return the table most likely to benefit from an index for *query*.
+
+        Prefers the table owning the WHERE columns; falls back to the table the
+        statement reads from or writes to. Used to introspect the live database.
+        """
+        table, _ = _resolve_filter_table(query)
+        return table or _extract_target_table(query)
 
     def generate_fix_sql(
         self, problem: dict[str, Any], schema: dict[str, Any]
@@ -221,18 +236,38 @@ class FixGenerator:
 # ---------------------------------------------------------------------------
 
 
+def _normalise(query: str) -> str:
+    """Strip identifier quoting so `"orders"."customer_id"` parses like ``orders.customer_id``.
+
+    PostgreSQL string literals use single quotes, so removing double quotes and
+    backticks cannot change a literal's contents.
+    """
+    return query.replace('"', "").replace("`", "")
+
+
 def _extract_from_table(query: str) -> str | None:
     """Return the first table name from the FROM clause."""
-    match = re.search(
-        r'\bFROM\s+([`"\[]?[\w.]+[`"\]]?)',
-        query,
-        re.IGNORECASE,
-    )
+    match = re.search(r"\bFROM\s+(?:ONLY\s+)?([\w.]+)", _normalise(query), re.IGNORECASE)
     if match:
-        raw = match.group(1)
         # Strip schema prefix (e.g. "public.users" → "users")
-        return raw.split(".")[-1].strip('`"[]')
+        return match.group(1).split(".")[-1]
     return None
+
+
+def _extract_write_table(query: str) -> str | None:
+    """Return the target table of an UPDATE or INSERT statement."""
+    normalised = _normalise(query)
+    match = re.search(
+        r"\bUPDATE\s+(?:ONLY\s+)?([\w.]+)", normalised, re.IGNORECASE
+    ) or re.search(r"\bINSERT\s+INTO\s+([\w.]+)", normalised, re.IGNORECASE)
+    if match:
+        return match.group(1).split(".")[-1]
+    return None
+
+
+def _extract_target_table(query: str) -> str | None:
+    """Return the table the statement reads from or writes to."""
+    return _extract_from_table(query) or _extract_write_table(query)
 
 
 def _extract_where_columns(query: str) -> list[str]:
@@ -240,7 +275,7 @@ def _extract_where_columns(query: str) -> list[str]:
 
     Only handles simple ``col = ...`` / ``col > ...`` / ``col IN ...`` patterns.
     """
-    where_match = re.search(r"\bWHERE\b(.+?)(?:\bORDER\b|\bGROUP\b|\bLIMIT\b|\bHAVING\b|$)", query, re.IGNORECASE | re.DOTALL)
+    where_match = re.search(r"\bWHERE\b(.+?)(?:\bORDER\b|\bGROUP\b|\bLIMIT\b|\bHAVING\b|$)", _normalise(query), re.IGNORECASE | re.DOTALL)
     if not where_match:
         return []
     where_clause = where_match.group(1)
@@ -249,6 +284,103 @@ def _extract_where_columns(query: str) -> list[str]:
     # Remove SQL keywords that may be captured
     keywords = {"AND", "OR", "NOT", "NULL", "TRUE", "FALSE", "IS", "IN", "LIKE", "BETWEEN"}
     return [c for c in dict.fromkeys(cols) if c.upper() not in keywords]
+
+
+def _extract_where_conditions(query: str) -> list[tuple[str | None, str]]:
+    """Return ``(qualifier, column)`` pairs for WHERE-clause comparisons.
+
+    The qualifier is the table name or alias in ``u.email = $1``; it is ``None``
+    for an unqualified ``email = $1``. Quoted identifiers are handled.
+    """
+    where_match = re.search(
+        r"\bWHERE\b(.+?)(?:\bORDER\b|\bGROUP\b|\bLIMIT\b|\bHAVING\b|$)",
+        _normalise(query),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not where_match:
+        return []
+    clause = where_match.group(1)
+    found = re.findall(
+        r"(?:([a-zA-Z_]\w*)\.)?([a-zA-Z_]\w*)\s*"
+        r"(?:=|>|<|>=|<=|!=|<>|\bIN\b|\bLIKE\b|\bIS\b)",
+        clause,
+        re.IGNORECASE,
+    )
+    keywords = {"AND", "OR", "NOT", "NULL", "TRUE", "FALSE", "IS", "IN", "LIKE", "BETWEEN"}
+    conditions: list[tuple[str | None, str]] = []
+    seen: set[tuple[str | None, str]] = set()
+    for qualifier, column in found:
+        if column.upper() in keywords:
+            continue
+        key = (qualifier.lower() if qualifier else None, column.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        conditions.append((qualifier or None, column))
+    return conditions
+
+
+def _table_alias_map(query: str) -> dict[str, str]:
+    """Map lowercased aliases (and table names) to their table name.
+
+    ``FROM orders o JOIN users u`` → ``{"orders": "orders", "o": "orders",
+    "users": "users", "u": "users"}``.
+    """
+    normalised = _normalise(query)
+    mapping: dict[str, str] = {}
+    keywords = {
+        "ON", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "INNER", "LEFT",
+        "RIGHT", "FULL", "OUTER", "CROSS", "JOIN", "USING", "UNION", "AS",
+        "SELECT", "SET", "VALUES", "RETURNING", "FOR", "OFFSET",
+    }
+    pattern = re.compile(
+        r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.]*)(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(normalised):
+        table = match.group(1).split(".")[-1]
+        mapping.setdefault(table.lower(), table)
+        alias = match.group(2)
+        if alias and alias.upper() not in keywords:
+            mapping.setdefault(alias.lower(), table)
+    return mapping
+
+
+def _resolve_filter_table(query: str) -> tuple[str | None, list[str]]:
+    """Return the table that owns the WHERE columns, plus those columns.
+
+    Resolves alias-qualified columns so a join filters the right table, e.g.
+    ``... FROM orders o JOIN users u WHERE u.email = $1`` → ``("users", ["email"])``.
+    Unqualified columns fall back to the statement's primary table.
+    """
+    conditions = _extract_where_conditions(query)
+    if not conditions:
+        return None, []
+
+    aliases = _table_alias_map(query)
+    default_table = _extract_target_table(query)
+
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    for qualifier, column in conditions:
+        if qualifier:
+            table = aliases.get(qualifier.lower())
+            if not table:
+                continue
+        else:
+            table = default_table
+            if not table:
+                continue
+        if table not in groups:
+            groups[table] = []
+            order.append(table)
+        groups[table].append(column)
+
+    if not groups:
+        return None, []
+
+    best = max(order, key=lambda t: len(groups[t]))
+    return best, groups[best]
 
 
 def _has_index(table: str, columns: list[str], existing_indexes: list[str]) -> bool:

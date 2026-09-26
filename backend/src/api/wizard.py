@@ -34,8 +34,10 @@ async def wizard_status(connection_id: str) -> WizardStatus:
         raise HTTPException(status_code=404, detail="Connection ID not found.")
 
     try:
+        # statement_cache_size=0: PgBouncer transaction poolers (e.g. Supabase
+        # port 6543) cannot support server-side prepared statements.
         conn: asyncpg.Connection = await asyncio.wait_for(
-            asyncpg.connect(dsn=dsn), timeout=5
+            asyncpg.connect(dsn=dsn, statement_cache_size=0), timeout=5
         )
     except Exception:
         raise HTTPException(status_code=502, detail="Could not connect to the database.")
