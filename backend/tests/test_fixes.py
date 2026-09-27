@@ -140,6 +140,133 @@ class TestGenerateFix:
 
 
 # ---------------------------------------------------------------------------
+# HypoPG validation on POST /api/fixes/generate
+# ---------------------------------------------------------------------------
+
+
+def _validation(**overrides) -> dict:
+    base = {
+        "validated": True,
+        "reason": None,
+        "baseline_cost": 71832.0,
+        "improved_cost": 6221.0,
+        "cost_reduction_percent": 91.3,
+        "baseline_scan_type": "Seq Scan",
+        "improved_scan_type": "Index Scan",
+        "planner_would_use_index": True,
+        "trials_run": 3,
+        "trials_using_index": 3,
+        "cost_reduction_min": 88.9,
+        "cost_reduction_max": 91.3,
+        "sample_values": {"$1": "'user_7@example.com'"},
+        "estimated_size_bytes": 2_516_582,
+        "proof_statement": "PostgreSQL planner confirmed: 91.3% reduction",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestGenerateHypoPG:
+    async def _generate_validated(self, validation) -> dict:
+        conn = _mock_conn(_BASE_ROW, columns=("id", "email"), row_estimate=50_000)
+        with patch(
+            "api.fixes._hypopg_validator.validate_index_fix",
+            new=AsyncMock(return_value=validation),
+        ):
+            resp = await _generate(conn, _BASE_ROW["query"])
+        assert resp.status_code == 200
+        return resp.json()
+
+    async def test_index_fix_carries_the_planner_proof(self):
+        body = await self._generate_validated(_validation())
+
+        assert body["hypopg_validation"]["validated"] is True
+        assert body["hypopg_validation"]["planner_would_use_index"] is True
+        assert body["hypopg_validation"]["baseline_cost"] == 71832.0
+        assert body["hypopg_validation"]["improved_scan_type"] == "Index Scan"
+        # Trial agreement and the stand-in value must survive to the client,
+        # which is what makes the claim auditable rather than magical.
+        assert body["hypopg_validation"]["trials_using_index"] == 3
+        assert body["hypopg_validation"]["cost_reduction_min"] == 88.9
+        assert body["hypopg_validation"]["sample_values"]["$1"] == (
+            "'user_7@example.com'"
+        )
+
+    async def test_proven_fix_replaces_the_guessed_speedup(self):
+        body = await self._generate_validated(_validation())
+
+        impact = body["expected_impact"]
+        assert impact["estimation_basis"] == "hypopg_planner"
+        # 71832 / 6221 ≈ 11.5×, not the 100× the heuristic claims.
+        assert impact["speedup_factor"] == pytest.approx(11.55, abs=0.02)
+        assert impact["after_ms"] == pytest.approx(600.0 / 11.546, abs=0.2)
+
+    async def test_speedup_is_capped_at_a_plausible_ceiling(self):
+        body = await self._generate_validated(
+            _validation(baseline_cost=1_000_000.0, improved_cost=1.0)
+        )
+
+        assert body["expected_impact"]["speedup_factor"] == 50.0
+
+    async def test_unproven_fix_keeps_the_heuristic(self):
+        body = await self._generate_validated(
+            _validation(
+                validated=False,
+                reason="hypopg_unavailable",
+                planner_would_use_index=None,
+            )
+        )
+
+        impact = body["expected_impact"]
+        assert impact["estimation_basis"] == "heuristic"
+        assert impact["after_ms"] == 6.0  # 600 ms / 100
+        assert body["hypopg_validation"]["reason"] == "hypopg_unavailable"
+
+    async def test_planner_rejecting_the_index_keeps_the_heuristic(self):
+        body = await self._generate_validated(
+            _validation(planner_would_use_index=False, cost_reduction_percent=0.4)
+        )
+
+        assert body["expected_impact"]["estimation_basis"] == "heuristic"
+        assert body["expected_impact"]["after_ms"] == 6.0
+
+    async def test_improved_cost_higher_than_baseline_keeps_the_heuristic(self):
+        body = await self._generate_validated(
+            _validation(improved_cost=80000.0, cost_reduction_percent=-11.4)
+        )
+
+        assert body["expected_impact"]["estimation_basis"] == "heuristic"
+        assert body["expected_impact"]["after_ms"] == 6.0
+
+    async def test_non_index_problem_skips_validation(self):
+        conn = _mock_conn(
+            {**_BASE_ROW, "query": "SELECT * FROM users WHERE id = $1"},
+            indexes=("idx_users_id",),
+            columns=("id", "email"),
+        )
+        validator = AsyncMock(return_value=_validation())
+        with patch("api.fixes._hypopg_validator.validate_index_fix", new=validator):
+            resp = await _generate(conn, "SELECT * FROM users WHERE id = $1")
+
+        body = resp.json()
+        assert body["problem"]["type"] == "select_star"
+        assert body["hypopg_validation"] is None
+        validator.assert_not_called()
+
+    async def test_missing_hypopg_does_not_fail_generation(self):
+        """A DB without the extension still returns a usable suggestion."""
+        conn = _mock_conn(_BASE_ROW, columns=("id", "email"), row_estimate=50_000)
+
+        resp = await _generate(conn, _BASE_ROW["query"])
+
+        body = resp.json()
+        assert body["problem"]["type"] == "missing_index"
+        assert body["hypopg_validation"]["validated"] is False
+        assert body["hypopg_validation"]["reason"] == "hypopg_unavailable"
+        assert "EXPLAIN" not in body["fix_sql"]
+
+
+# ---------------------------------------------------------------------------
 # POST /api/fixes/save + GET /api/fixes/history/{connection_id}
 # ---------------------------------------------------------------------------
 

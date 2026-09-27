@@ -25,6 +25,29 @@ interface ExpectedImpact {
   after_ms: number
   speedup_factor: number
   time_saved_per_day_minutes: number
+  /** 'hypopg_planner' when a hypothetical index proved the numbers. */
+  estimation_basis?: 'heuristic' | 'hypopg_planner'
+}
+
+interface HypopgValidation {
+  validated: boolean
+  reason: string | null
+  /** Database's own error text when a step failed; diagnostic only. */
+  detail?: string | null
+  baseline_cost: number | null
+  improved_cost: number | null
+  cost_reduction_percent: number | null
+  cost_reduction_min?: number | null
+  cost_reduction_max?: number | null
+  baseline_scan_type: string | null
+  improved_scan_type: string | null
+  planner_would_use_index: boolean | null
+  trials_run?: number
+  trials_using_index?: number | null
+  /** Stand-in values the planner was shown for each `$n` in the query. */
+  sample_values?: Record<string, string> | null
+  estimated_size_bytes: number | null
+  proof_statement: string | null
 }
 
 interface GenerateResponse {
@@ -33,6 +56,7 @@ interface GenerateResponse {
   rollback_sql: string
   expected_impact: ExpectedImpact
   ai_explanation: string
+  hypopg_validation?: HypopgValidation | null
 }
 
 // SSE apply events: { event, data }
@@ -115,6 +139,50 @@ function isCodeChangeOnly(fixSql: string): boolean {
   return fixSql.trim().startsWith('--')
 }
 
+/** Why HypoPG could not prove the fix, phrased for the UI. */
+const VALIDATION_REASONS: Record<string, string> = {
+  hypopg_unavailable:
+    'HypoPG is not installed on this database, so this improvement is estimated rather than proven.',
+  explain_failed:
+    "PostgreSQL could not plan this query, so this improvement is estimated rather than proven.",
+  hypopg_create_failed:
+    'HypoPG could not create the hypothetical index, so this improvement is estimated rather than proven.',
+  no_index_target:
+    'No concrete index columns were identified to test, so this improvement is estimated.',
+}
+
+function validationReasonText(reason: string | null): string {
+  if (reason && VALIDATION_REASONS[reason]) return VALIDATION_REASONS[reason]
+  return 'Hypothetical index testing was not possible, so this improvement is estimated.'
+}
+
+function formatBytes(bytes: number | null): string {
+  if (bytes === null || bytes <= 0) return '—'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatCost(cost: number | null): string {
+  if (cost === null) return '—'
+  return cost.toLocaleString(undefined, { maximumFractionDigits: 0 })
+}
+
+/** Median reduction, widened to a range when several values were tested. */
+function reductionLabel(v: HypopgValidation): string {
+  const median = v.cost_reduction_percent
+  if (median === null) return '0.0%'
+  const min = v.cost_reduction_min ?? median
+  const max = v.cost_reduction_max ?? median
+  if (min === max) return `${median.toFixed(1)}%`
+  return `${min.toFixed(1)}–${max.toFixed(1)}% (median ${median.toFixed(1)}%)`
+}
+
+function trialsNote(v: HypopgValidation): string {
+  if (!v.trials_run || v.trials_run < 2 || v.trials_using_index === null) return ''
+  return ` (${v.trials_using_index} of ${v.trials_run} sampled values)`
+}
+
 // ---------------------------------------------------------------------------
 // Small shared components
 // ---------------------------------------------------------------------------
@@ -180,6 +248,7 @@ function ImpactSection({ impact }: { impact: ExpectedImpact }) {
     savedMin < 1
       ? `${(savedMin * 60).toFixed(0)}s`
       : `${savedMin.toFixed(1)} min`
+  const provenByPlanner = impact.estimation_basis === 'hypopg_planner'
 
   return (
     <Section title="Expected Impact">
@@ -198,7 +267,9 @@ function ImpactSection({ impact }: { impact: ExpectedImpact }) {
             ~{impact.after_ms.toFixed(1)}
             <span className="text-base font-semibold">ms</span>
           </p>
-          <p className="text-xs text-slate-500 mt-0.5">estimated</p>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {provenByPlanner ? 'planner-derived' : 'estimated'}
+          </p>
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-4 rounded-xl border border-slate-700 bg-slate-800/40 px-5 py-3">
@@ -208,6 +279,129 @@ function ImpactSection({ impact }: { impact: ExpectedImpact }) {
         <span className="text-sm text-slate-400">
           Saves <span className="font-semibold text-slate-200">{savedDisplay}</span> per day
         </span>
+        {provenByPlanner && (
+          <span className="text-xs text-slate-500">
+            derived from measured planner costs
+          </span>
+        )}
+      </div>
+    </Section>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Section 3b — HypoPG what-if validation
+// ---------------------------------------------------------------------------
+
+function ValidationSection({ validation }: { validation: HypopgValidation }) {
+  const proven = validation.validated && validation.planner_would_use_index === true
+  const tested = validation.validated
+
+  const tone = proven
+    ? 'border-emerald-500/40 bg-emerald-500/10'
+    : tested
+      ? 'border-yellow-500/40 bg-yellow-500/10'
+      : 'border-slate-700 bg-slate-800/60'
+
+  return (
+    <Section title="Hypothetical Index Test">
+      <div className={`rounded-xl border ${tone} p-5 space-y-4`}>
+        <div className="flex items-center gap-2">
+          <span
+            className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-xs font-bold uppercase tracking-wide ${
+              proven
+                ? 'border-emerald-500/30 bg-emerald-500/20 text-emerald-300'
+                : tested
+                  ? 'border-yellow-500/30 bg-yellow-500/20 text-yellow-300'
+                  : 'border-slate-600 bg-slate-700/60 text-slate-300'
+            }`}
+          >
+            {proven ? '✅ VALIDATED' : tested ? '⚠️ LIMITED IMPACT' : 'ℹ️ NOT PROVEN'}
+          </span>
+          <span className="text-xs text-slate-400">
+            Powered by HypoPG — no changes written to your database
+          </span>
+        </div>
+
+        {tested ? (
+          <>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
+                <p className="text-xs font-semibold uppercase tracking-widest text-slate-500 mb-1">
+                  Before (no index)
+                </p>
+                <p className="text-sm font-semibold text-red-300">
+                  {validation.baseline_scan_type ?? '—'}
+                </p>
+                <p className="mt-1 text-lg font-extrabold tabular-nums text-slate-200">
+                  {formatCost(validation.baseline_cost)}
+                </p>
+                <p className="text-xs text-slate-500">planner cost</p>
+              </div>
+              <div className="rounded-xl border border-emerald-500/30 bg-slate-900/60 p-4">
+                <p className="text-xs font-semibold uppercase tracking-widest text-slate-500 mb-1">
+                  After (hypothetical index)
+                </p>
+                <p className="text-sm font-semibold text-emerald-300">
+                  {validation.improved_scan_type ?? '—'}
+                  {proven && <span className="ml-1">✅</span>}
+                </p>
+                <p className="mt-1 text-lg font-extrabold tabular-nums text-slate-200">
+                  {formatCost(validation.improved_cost)}
+                </p>
+                <p className="text-xs text-slate-500">planner cost</p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
+              <span className="font-bold text-emerald-400">
+                Cost reduction {reductionLabel(validation)}
+              </span>
+              <span className="text-slate-400">
+                Planner would use index:{' '}
+                <span className={proven ? 'font-semibold text-emerald-300' : 'font-semibold text-yellow-300'}>
+                  {proven ? '✅ Confirmed' : '❌ No'}
+                  {trialsNote(validation)}
+                </span>
+              </span>
+              <span className="text-slate-400">
+                Index size ≤{' '}
+                <span className="font-semibold text-slate-200">
+                  {formatBytes(validation.estimated_size_bytes)}
+                </span>
+                <span className="text-xs text-slate-500"> (HypoPG over-reports)</span>
+              </span>
+            </div>
+
+            {validation.sample_values &&
+              Object.keys(validation.sample_values).length > 0 && (
+                <p className="text-xs leading-relaxed text-slate-500">
+                  Tested with representative values sampled from your table:{' '}
+                  <span className="font-mono text-slate-400">
+                    {Object.entries(validation.sample_values)
+                      .map(([token, value]) => `${token} = ${value}`)
+                      .join(', ')}
+                  </span>
+                </p>
+              )}
+
+            {validation.proof_statement && (
+              <p className="text-sm leading-relaxed text-slate-300">
+                {validation.proof_statement}
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="text-sm leading-relaxed text-slate-400">
+            {validationReasonText(validation.reason)}
+          </p>
+        )}
+
+        {!tested && validation.detail && (
+          <p className="text-xs leading-relaxed text-slate-500">
+            Database said: <span className="font-mono">{validation.detail}</span>
+          </p>
+        )}
       </div>
     </Section>
   )
@@ -747,10 +941,15 @@ export default function FixPage() {
                   </div>
                 </Section>
 
-                {/* ── Section 3: Expected Impact ────────────────────────── */}
+                {/* ── Section 3: Hypothetical index test ────────────────── */}
+                {genData.hypopg_validation && (
+                  <ValidationSection validation={genData.hypopg_validation} />
+                )}
+
+                {/* ── Section 4: Expected Impact ────────────────────────── */}
                 <ImpactSection impact={genData.expected_impact} />
 
-                {/* ── Section 4: Safety ─────────────────────────────────── */}
+                {/* ── Section 5: Safety ─────────────────────────────────── */}
                 <SafetySection fixSql={genData.fix_sql} />
 
                 {/* ── Apply progress (shown while applying / after) ─────── */}
@@ -765,7 +964,7 @@ export default function FixPage() {
                   </Section>
                 )}
 
-                {/* ── Section 5: Actions ────────────────────────────────── */}
+                {/* ── Section 6: Actions ────────────────────────────────── */}
                 {(phase === 'ready' || phase === 'error') && (
                   <Section title="Actions">
                     <div className="space-y-3">
@@ -774,7 +973,10 @@ export default function FixPage() {
                         disabled={phase !== 'ready'}
                         className="w-full rounded-xl bg-emerald-600 py-3.5 text-sm font-bold text-white shadow-lg transition-colors hover:bg-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
-                        ✅ Apply This Fix
+                        {genData.hypopg_validation?.validated &&
+                        genData.hypopg_validation?.planner_would_use_index
+                          ? '✅ Apply Validated Fix'
+                          : '✅ Apply This Fix'}
                       </button>
 
                       <div className="flex items-center gap-3">

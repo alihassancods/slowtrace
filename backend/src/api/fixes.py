@@ -1,6 +1,6 @@
 """Fix management routes.
 
-POST /api/fixes/generate  — generate fix SQL + AI explanation
+POST /api/fixes/generate  — generate fix SQL + AI explanation (+ HypoPG proof)
 POST /api/fixes/apply     — SSE stream of fix execution progress
 POST /api/fixes/rollback  — manually roll back a fix
 GET  /api/fixes/history/{connection_id} — list applied fixes
@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from api.store import CONNECTIONS
 from agent.autofix.fix_generator import FixGenerator
 from agent.autofix.fix_executor import FixExecutor, _load_history
+from agent.autofix.hypopg_validator import HypoPGValidator
 from services.ai_explainer import AIExplainer
 
 router = APIRouter()
@@ -28,6 +29,13 @@ router = APIRouter()
 _fix_generator = FixGenerator()
 _fix_executor = FixExecutor()
 _ai_explainer = AIExplainer()
+_hypopg_validator = HypoPGValidator()
+
+# Problem types whose fix is a real index, and so can be proved with HypoPG.
+_INDEX_PROBLEM_TYPES = frozenset({"missing_index", "seq_scan"})
+
+# Planner cost ratios can be extreme on tiny tables; cap the claimed speedup.
+_MAX_PLANNER_SPEEDUP = 50.0
 
 # ---------------------------------------------------------------------------
 # SQL
@@ -92,6 +100,8 @@ class GenerateResponse(BaseModel):
     rollback_sql: str
     expected_impact: dict[str, Any]
     ai_explanation: str
+    # HypoPG what-if proof for index fixes; None for non-index problems.
+    hypopg_validation: dict[str, Any] | None = None
 
 
 class SaveRequest(BaseModel):
@@ -190,6 +200,72 @@ async def _introspect_table(
     return indexes, columns, row_estimate
 
 
+async def _validate_index_fix(
+    conn: asyncpg.Connection,
+    query_text: str,
+    problem: dict[str, Any],
+    fix_info: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Prove an index suggestion with HypoPG; ``None`` for non-index fixes.
+
+    Must run on the live connection: hypothetical indexes are session-local.
+    """
+    if problem.get("type") not in _INDEX_PROBLEM_TYPES:
+        return None
+
+    return await _hypopg_validator.validate_index_fix(
+        conn,
+        table=problem.get("table"),
+        columns=list(problem.get("columns") or []),
+        slow_query=query_text,
+        index_ddl=fix_info.get("fix_sql"),
+    )
+
+
+def _apply_planner_impact(
+    impact: dict[str, Any],
+    validation: dict[str, Any],
+    query_stats: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace the guessed speedup with the planner's own cost ratio.
+
+    Only a validated fix the planner would actually use rewrites the numbers;
+    anything else keeps the heuristic estimate and says so.
+    """
+    refined = {**impact, "estimation_basis": "heuristic"}
+
+    baseline_cost = float(validation.get("baseline_cost") or 0.0)
+    improved_cost = validation.get("improved_cost")
+    if (
+        not validation.get("validated")
+        or not validation.get("planner_would_use_index")
+        or baseline_cost <= 0
+        or improved_cost is None
+        or float(improved_cost) >= baseline_cost
+    ):
+        return refined
+
+    before_ms = float(query_stats.get("mean_exec_time_ms", 0))
+    if before_ms <= 0:
+        return refined
+
+    speedup = min(baseline_cost / float(improved_cost), _MAX_PLANNER_SPEEDUP)
+    after_ms = before_ms / speedup
+    calls_per_day = float(query_stats.get("calls", 1))
+
+    refined.update(
+        {
+            "after_ms": round(after_ms, 3),
+            "speedup_factor": round(speedup, 2),
+            "time_saved_per_day_minutes": round(
+                (before_ms - after_ms) * calls_per_day / 1000 / 60, 2
+            ),
+            "estimation_basis": "hypopg_planner",
+        }
+    )
+    return refined
+
+
 # ---------------------------------------------------------------------------
 # POST /api/fixes/generate
 # ---------------------------------------------------------------------------
@@ -197,7 +273,13 @@ async def _introspect_table(
 
 @router.post("/fixes/generate", response_model=GenerateResponse)
 async def generate_fix(body: GenerateRequest) -> GenerateResponse:
-    """Detect the problem for a query and generate fix SQL with AI explanation."""
+    """Detect the problem for a query and generate fix SQL with AI explanation.
+
+    Index suggestions are additionally proved with HypoPG when the monitored
+    database has the extension: the planner costs the query against a
+    hypothetical index, the index is dropped again, and the impact numbers are
+    re-derived from the measured cost ratio instead of a fixed guess.
+    """
     dsn = CONNECTIONS.get(body.connection_id)
     if dsn is None:
         raise HTTPException(status_code=404, detail="Connection ID not found.")
@@ -225,14 +307,22 @@ async def generate_fix(body: GenerateRequest) -> GenerateResponse:
                 schema["columns"][table] = columns
             if row_estimate is not None:
                 table_row_counts[table] = row_estimate
+
+        query_stats["table_row_counts"] = table_row_counts
+
+        problem = _fix_generator.detect_problem(query_text, query_stats)
+        fix_info = _fix_generator.generate_fix_sql(problem, schema)
+        expected_impact = _fix_generator.calculate_expected_impact(problem, query_stats)
+
+        # HypoPG needs the same session the hypothetical index lives in, so the
+        # validation runs here rather than after the connection is closed.
+        validation = await _validate_index_fix(conn, query_text, problem, fix_info)
+        if validation is not None:
+            expected_impact = _apply_planner_impact(
+                expected_impact, validation, query_stats
+            )
     finally:
         await conn.close()
-
-    query_stats["table_row_counts"] = table_row_counts
-
-    problem = _fix_generator.detect_problem(query_text, query_stats)
-    fix_info = _fix_generator.generate_fix_sql(problem, schema)
-    expected_impact = _fix_generator.calculate_expected_impact(problem, query_stats)
 
     ai_explanation = await _ai_explainer.explain_problem(query_text, problem, query_stats)
 
@@ -242,6 +332,7 @@ async def generate_fix(body: GenerateRequest) -> GenerateResponse:
         rollback_sql=fix_info.get("rollback_sql", ""),
         expected_impact=expected_impact,
         ai_explanation=ai_explanation,
+        hypopg_validation=validation,
     )
 
 
