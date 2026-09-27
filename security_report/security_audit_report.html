@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SlowTrace Security Audit Report</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #1f2328;
+    background: #ffffff;
+    padding: 32px 16px 48px;
+  }
+  .container { max-width: 760px; margin: 0 auto; }
+
+  /* Header */
+  .report-header { border-bottom: 2px solid #e5e7eb; padding-bottom: 20px; margin-bottom: 28px; }
+  .report-header h1 { font-size: 22px; font-weight: 700; color: #1f2328; }
+  .report-header .subtitle { color: #57606a; font-size: 13px; margin-top: 4px; }
+  .report-meta { display: flex; gap: 24px; margin-top: 14px; flex-wrap: wrap; }
+  .meta-item { font-size: 13px; color: #57606a; }
+  .meta-item strong { color: #1f2328; }
+
+  /* Summary bar */
+  .summary-bar {
+    background: #f7f8fa;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 16px 20px;
+    margin-bottom: 28px;
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .summary-stat { text-align: center; }
+  .summary-stat .number { font-size: 28px; font-weight: 700; }
+  .summary-stat .label { font-size: 12px; color: #57606a; margin-top: 2px; }
+  .number.found { color: #cf222e; }
+  .number.fixed { color: #1a7f37; }
+  .number.none  { color: #57606a; }
+
+  /* Badges */
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .badge-high   { background: #ffeef0; color: #cf222e; border: 1px solid #ffa0a8; }
+  .badge-medium { background: #fff8c5; color: #9a6700; border: 1px solid #e8c44e; }
+  .badge-fixed  { background: #ddf4ff; color: #0969da; border: 1px solid #7ec8f6; }
+
+  /* Section heading */
+  h2 { font-size: 16px; font-weight: 700; margin: 32px 0 14px; color: #1f2328; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; }
+
+  /* Finding cards */
+  .finding {
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  .finding-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 14px 16px;
+    background: #f7f8fa;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  .finding-header .number-circle {
+    min-width: 26px; height: 26px;
+    border-radius: 50%;
+    background: #e5e7eb;
+    color: #57606a;
+    font-weight: 700;
+    font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .finding-header .title-block { flex: 1; }
+  .finding-header h3 { font-size: 14px; font-weight: 700; color: #1f2328; margin-bottom: 3px; }
+  .finding-body { padding: 14px 16px; }
+  .finding-section { margin-bottom: 12px; }
+  .finding-section:last-child { margin-bottom: 0; }
+  .section-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #57606a; margin-bottom: 4px; }
+  .section-text { font-size: 13px; color: #1f2328; }
+
+  /* Code blocks */
+  pre {
+    background: #f6f8fa;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    overflow-x: auto;
+    white-space: pre;
+    color: #1f2328;
+    margin-top: 4px;
+  }
+  pre .del { color: #cf222e; }
+  pre .add { color: #1a7f37; }
+
+  /* Check table */
+  .check-table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 13px; }
+  .check-table th { text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #57606a; padding: 6px 10px; border-bottom: 1px solid #e5e7eb; }
+  .check-table td { padding: 8px 10px; border-bottom: 1px solid #f7f8fa; vertical-align: top; }
+  .check-table tr:last-child td { border-bottom: none; }
+  .check-table td:first-child { width: 38%; }
+  .check-table td:nth-child(2) { width: 16%; }
+  .status-pass  { color: #1a7f37; font-weight: 600; }
+  .status-fixed { color: #0969da; font-weight: 600; }
+
+  /* Footer */
+  footer {
+    margin-top: 48px;
+    padding-top: 16px;
+    border-top: 1px solid #e5e7eb;
+    text-align: center;
+    font-size: 12px;
+    color: #57606a;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="report-header">
+    <h1>SlowTrace Backend — Security Audit Report</h1>
+    <div class="subtitle">IBM Hackathon Submission · Backend codebase · <code>backend/src/</code></div>
+    <div class="report-meta">
+      <div class="meta-item"><strong>Scope:</strong> All Python source files under backend/src/</div>
+      <div class="meta-item"><strong>Files Reviewed:</strong> 14</div>
+      <div class="meta-item"><strong>Tests After Fix:</strong> 329 / 329 passed</div>
+      <div class="meta-item"><strong>Stack:</strong> FastAPI · asyncpg · Pydantic v2</div>
+    </div>
+  </div>
+
+  <!-- Summary -->
+  <div class="summary-bar">
+    <div class="summary-stat">
+      <div class="number found">6</div>
+      <div class="label">Issues Found</div>
+    </div>
+    <div class="summary-stat">
+      <div class="number fixed">6</div>
+      <div class="label">Issues Fixed</div>
+    </div>
+    <div class="summary-stat">
+      <div class="number none">0</div>
+      <div class="label">SQL Injections</div>
+    </div>
+    <div class="summary-stat">
+      <div class="number none">0</div>
+      <div class="label">Hardcoded Credentials</div>
+    </div>
+  </div>
+
+  <!-- Checklist overview -->
+  <h2>Audit Checklist</h2>
+  <table class="check-table">
+    <thead>
+      <tr>
+        <th>Check</th>
+        <th>Result</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>SQL Injection</td>
+        <td class="status-pass">✓ Clean</td>
+        <td>All queries use asyncpg parameterised placeholders ($1, $2…). No string interpolation into SQL executed against the DB.</td>
+      </tr>
+      <tr>
+        <td>Exposed Credentials</td>
+        <td class="status-pass">✓ Clean</td>
+        <td>API key read from <code>os.environ</code> only. <code>.env.example</code> contains placeholders, not real secrets.</td>
+      </tr>
+      <tr>
+        <td>DB Connection Handling</td>
+        <td class="status-pass">✓ Clean</td>
+        <td>Connections always closed in <code>finally</code> blocks. Pool used with min/max size limits. No DSN logging.</td>
+      </tr>
+      <tr>
+        <td>CORS Configuration</td>
+        <td class="status-fixed">⬆ Fixed</td>
+        <td>Reduced from wildcard methods/headers to explicit allow-list. See Issue #1.</td>
+      </tr>
+      <tr>
+        <td>Input Validation</td>
+        <td class="status-fixed">⬆ Fixed</td>
+        <td>Added Pydantic validator enforcing protocol prefix and 2048-char cap. See Issues #2 &amp; #3.</td>
+      </tr>
+      <tr>
+        <td>Error Message Exposure</td>
+        <td class="status-fixed">⬆ Fixed</td>
+        <td>Raw exception text stripped from all 502 HTTP responses and SSE error events. See Issue #4.</td>
+      </tr>
+      <tr>
+        <td>DSN Credential Leak in Responses</td>
+        <td class="status-fixed">⬆ Fixed</td>
+        <td>Legacy routes that echo the DSN as <code>connection_id</code> now redact the password. See Issue #5.</td>
+      </tr>
+      <tr>
+        <td>Fix History Scope</td>
+        <td class="status-fixed">⬆ Fixed</td>
+        <td><code>GET /api/fixes/history</code> now scopes results to the caller's connection_id. See Issue #6.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- Findings -->
+  <h2>Detailed Findings</h2>
+
+  <!-- Issue 1 -->
+  <div class="finding">
+    <div class="finding-header">
+      <div class="number-circle">1</div>
+      <div class="title-block">
+        <h3>Overly Permissive CORS Configuration</h3>
+        <span class="badge badge-medium">Medium</span>&nbsp;<span class="badge badge-fixed">Fixed</span>
+      </div>
+    </div>
+    <div class="finding-body">
+      <div class="finding-section">
+        <div class="section-label">File</div>
+        <div class="section-text"><code>backend/src/api/main.py</code> line 27</div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerability</div>
+        <div class="section-text">
+          <code>allow_methods=["*"]</code> and <code>allow_headers=["*"]</code> permitted any HTTP method (DELETE, PUT, PATCH…) and any request header from the allowed origin. For a read-heavy SSE API this is far wider than required.
+        </div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Fix Applied</div>
+<pre>
+<span class="del">-    allow_methods=["*"],</span>
+<span class="del">-    allow_headers=["*"],</span>
+<span class="add">+    allow_methods=["GET", "POST", "OPTIONS"],</span>
+<span class="add">+    allow_headers=["Content-Type", "Accept", "Authorization", "Cache-Control"],</span>
+</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Issue 2 -->
+  <div class="finding">
+    <div class="finding-header">
+      <div class="number-circle">2</div>
+      <div class="title-block">
+        <h3>No Input Validation on Connection String — <code>/connections/test</code></h3>
+        <span class="badge badge-high">High</span>&nbsp;<span class="badge badge-fixed">Fixed</span>
+      </div>
+    </div>
+    <div class="finding-body">
+      <div class="finding-section">
+        <div class="section-label">File</div>
+        <div class="section-text"><code>backend/src/api/connections.py</code> line 30</div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerability</div>
+        <div class="section-text">
+          Any arbitrary string was accepted as a connection string with no length cap or format check. An attacker could supply an oversized payload or a non-DSN value that causes unexpected behaviour in asyncpg.
+        </div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Fix Applied</div>
+<pre>
+<span class="add">+   @field_validator("connection_string")</span>
+<span class="add">+   @classmethod</span>
+<span class="add">+   def validate_connection_string(cls, v: str) -> str:</span>
+<span class="add">+       v = v.strip()</span>
+<span class="add">+       if len(v) > 2048:</span>
+<span class="add">+           raise ValueError("Connection string is too long (max 2048 characters).")</span>
+<span class="add">+       if not v.startswith(("postgresql://", "postgres://")):</span>
+<span class="add">+           raise ValueError(</span>
+<span class="add">+               "Connection string must start with 'postgresql://' or 'postgres://'."</span>
+<span class="add">+           )</span>
+<span class="add">+       return v</span>
+</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Issue 3 -->
+  <div class="finding">
+    <div class="finding-header">
+      <div class="number-circle">3</div>
+      <div class="title-block">
+        <h3>No Input Validation on Connection String — <code>/scan/register</code></h3>
+        <span class="badge badge-high">High</span>&nbsp;<span class="badge badge-fixed">Fixed</span>
+      </div>
+    </div>
+    <div class="finding-body">
+      <div class="finding-section">
+        <div class="section-label">File</div>
+        <div class="section-text"><code>backend/src/api/scan.py</code> — <code>_RegisterRequest</code></div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerability</div>
+        <div class="section-text">
+          The backwards-compatible <code>POST /api/scan/register</code> endpoint stored any string in the in-memory CONNECTIONS registry without validation. Same protocol-prefix and length check applied as Issue #2.
+        </div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Fix Applied</div>
+        <div class="section-text">Identical <code>field_validator</code> added to <code>_RegisterRequest</code> in <code>scan.py</code>.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Issue 4 -->
+  <div class="finding">
+    <div class="finding-header">
+      <div class="number-circle">4</div>
+      <div class="title-block">
+        <h3>Raw Exception Detail Leaked in HTTP 502 &amp; SSE Error Responses</h3>
+        <span class="badge badge-medium">Medium</span>&nbsp;<span class="badge badge-fixed">Fixed</span>
+      </div>
+    </div>
+    <div class="finding-body">
+      <div class="finding-section">
+        <div class="section-label">File</div>
+        <div class="section-text"><code>backend/src/api/fixes.py</code> lines 111, 119, 228</div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerability</div>
+        <div class="section-text">
+          Raw <code>Exception</code> strings were interpolated directly into <code>HTTPException(detail=…)</code> and SSE <code>"error"</code> events and returned to clients. This can expose internal hostnames, file paths, driver version strings, and PostgreSQL error codes.
+        </div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerable Code</div>
+<pre>
+<span class="del">-    except Exception as exc:</span>
+<span class="del">-        raise HTTPException(status_code=502, detail=f"Database connection failed: {exc}")</span>
+<span class="del">-    except Exception as exc:</span>
+<span class="del">-        raise HTTPException(status_code=502, detail=f"Query fetch failed: {exc}")</span>
+<span class="del">-    except Exception as exc:</span>
+<span class="del">-        yield _sse("error", {"message": f"Database connection failed: {exc}"})</span>
+</pre>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Fix Applied</div>
+<pre>
+<span class="add">+    except asyncpg.InvalidPasswordError:</span>
+<span class="add">+        raise HTTPException(status_code=502, detail="Database authentication failed.")</span>
+<span class="add">+    except asyncpg.InvalidCatalogNameError:</span>
+<span class="add">+        raise HTTPException(status_code=502, detail="Database not found.")</span>
+<span class="add">+    except OSError:</span>
+<span class="add">+        raise HTTPException(status_code=502, detail="Database host not reachable.")</span>
+<span class="add">+    except Exception:</span>
+<span class="add">+        raise HTTPException(status_code=502, detail="Database connection failed.")</span>
+</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Issue 5 -->
+  <div class="finding">
+    <div class="finding-header">
+      <div class="number-circle">5</div>
+      <div class="title-block">
+        <h3>Database Password Reflected in API Response Bodies (Legacy Routes)</h3>
+        <span class="badge badge-high">High</span>&nbsp;<span class="badge badge-fixed">Fixed</span>
+      </div>
+    </div>
+    <div class="finding-body">
+      <div class="finding-section">
+        <div class="section-label">Files</div>
+        <div class="section-text">
+          <code>dashboard.py</code>, <code>health.py</code>, <code>explain.py</code>, <code>fix.py</code>
+        </div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerability</div>
+        <div class="section-text">
+          Legacy routes accept the DSN as a URL path segment and echo it back verbatim in the JSON response body as the <code>connection_id</code> field. Any DSN containing a password (e.g. <code>postgresql://user:secret@host/db</code>) was returned to the caller in cleartext.
+        </div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerable Code</div>
+<pre>
+<span class="del">-    dsn = unquote(connection_id)</span>
+<span class="del">-    return DashboardReport(connection_id=dsn, ...)</span>
+</pre>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Fix Applied</div>
+<pre>
+<span class="add">+   def _redact_dsn(dsn: str) -> str:</span>
+<span class="add">+       return re.sub(r"(://[^:@/]*:)[^@/]+(@)", r"\1***\2", dsn)</span>
+<span class="add">+</span>
+<span class="add">+   safe_id = _redact_dsn(dsn)</span>
+<span class="add">+   return DashboardReport(connection_id=safe_id, ...)</span>
+</pre>
+        <div class="section-text" style="margin-top:6px;">Same helper added to <code>health.py</code>, <code>explain.py</code>, and <code>fix.py</code>.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Issue 6 -->
+  <div class="finding">
+    <div class="finding-header">
+      <div class="number-circle">6</div>
+      <div class="title-block">
+        <h3>Fix History Endpoint Returns All Records Regardless of Caller</h3>
+        <span class="badge badge-medium">Medium</span>&nbsp;<span class="badge badge-fixed">Fixed</span>
+      </div>
+    </div>
+    <div class="finding-body">
+      <div class="finding-section">
+        <div class="section-label">File</div>
+        <div class="section-text"><code>backend/src/api/fixes.py</code> — <code>GET /api/fixes/history/{connection_id}</code></div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerability</div>
+        <div class="section-text">
+          The endpoint validated that the supplied <code>connection_id</code> existed but then returned the full <code>fix_history.json</code> — all fix records for all connections — to the caller. In a multi-user or multi-database scenario this is an information disclosure vulnerability.
+        </div>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Vulnerable Code</div>
+<pre>
+<span class="del">-    return _load_history()   # returns ALL records</span>
+</pre>
+      </div>
+      <div class="finding-section">
+        <div class="section-label">Fix Applied</div>
+<pre>
+<span class="add">+   history = _load_history()</span>
+<span class="add">+   scoped = [r for r in history if r.get("connection_id") == connection_id]</span>
+<span class="add">+   return scoped if scoped else [r for r in history if "connection_id" not in r]</span>
+</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Items confirmed clean -->
+  <h2>Items Confirmed Clean (No Changes Required)</h2>
+  <table class="check-table">
+    <thead>
+      <tr><th>Item</th><th>Evidence</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>SQL Injection</td>
+        <td>Every query uses asyncpg positional parameters (<code>$1</code>, <code>$2</code>…). The only dynamic SQL is <code>EXPLAIN (…) {query_text}</code> — but <code>query_text</code> is always sourced from <code>pg_stat_statements.query</code>, never from user-supplied input.</td>
+      </tr>
+      <tr>
+        <td>Hardcoded Credentials</td>
+        <td><code>DEEPSEEK_API_KEY</code> / <code>OPENAI_API_KEY</code> read exclusively from environment variables in <code>ai_explainer.py</code>. <code>.env.example</code> contains only placeholder text.</td>
+      </tr>
+      <tr>
+        <td>DB Connection String Logging</td>
+        <td>No <code>logging.info</code>, <code>print</code>, or similar calls reference the DSN anywhere in the codebase.</td>
+      </tr>
+      <tr>
+        <td>SSL Enforcement</td>
+        <td>The connector correctly detects the "SSL required" error from PostgreSQL and surfaces a clear user message without exposing internal detail. Callers can include <code>?sslmode=require</code> in their DSN.</td>
+      </tr>
+      <tr>
+        <td>Connection Pool Safety</td>
+        <td>All connections closed in <code>finally</code> blocks. Pool min/max sizes configured. <code>asyncio.wait_for</code> timeouts applied to every remote call.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <footer>Made with IBM Bob</footer>
+</div>
+</body>
+</html>

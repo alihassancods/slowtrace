@@ -1,0 +1,331 @@
+# SlowTrace codebase rules — ORM/database performance and SQL-injection smells.
+#
+# Detected by running Semgrep over a cloned repository:
+#   semgrep --config <this file> --json --metrics=off -q <clone_dir>
+#
+# Every rule carries `metadata.smell_id` (the grouping key the API and UI use)
+# and, where a fix is mechanical, `metadata.fix_code` (rendered verbatim).
+# Severity is Semgrep's own vocabulary: ERROR | WARNING | INFO.
+#
+# Two syntax notes that are easy to get wrong and are load-bearing here:
+#   * An ellipsis must sit on its own line (`...` as a whole statement). The
+#     inline form `... $EXPR ...` is a parse error and the rule will not load.
+#   * Template-literal patterns like `$DB.query(``SELECT ... ${$X}``)` parse but
+#     never match; `javascript-sql-template-literal` uses metavariable-regex
+#     against the raw argument text instead.
+
+rules:
+  # --------------------------------------------------------------------------
+  # 1. Django N+1 — related manager called inside a loop
+  # --------------------------------------------------------------------------
+  - id: django-n-plus-one-loop
+    patterns:
+      - pattern: |
+          for $ITEM in $QUERYSET:
+              ...
+              $ITEM.$REL.all()
+    message: >
+      N+1 query detected. '$ITEM.$REL.all()' inside a loop
+      runs one database query per iteration.
+      With 1000 items this is 1000 separate queries.
+      Fix: Add .prefetch_related('$REL') to $QUERYSET
+      before the loop.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: performance
+      smell_id: n_plus_one
+      fix_code: |
+        # Change this:
+        for item in queryset:
+            related = item.relation.all()
+
+        # To this:
+        queryset = queryset.prefetch_related('relation')
+        for item in queryset:
+            related = item.relation.all()  # no extra query!
+
+  # --------------------------------------------------------------------------
+  # 2. Django N+1 — foreign-key attribute traversed inside a loop
+  # --------------------------------------------------------------------------
+  - id: django-n-plus-one-fk-access
+    patterns:
+      - pattern: |
+          for $ITEM in $QUERYSET:
+              ...
+              $ITEM.$FK.$FIELD
+    message: >
+      N+1 query pattern. Accessing '$ITEM.$FK.$FIELD' in a loop
+      triggers a separate database query for each '$FK'
+      relationship. Fix: Add .select_related('$FK') to
+      your queryset before the loop.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: performance
+      smell_id: n_plus_one
+      fix_code: |
+        queryset = queryset.select_related('foreign_key')
+
+  # --------------------------------------------------------------------------
+  # 3. JavaScript/TypeScript N+1 — awaited query inside a for loop
+  # --------------------------------------------------------------------------
+  - id: javascript-n-plus-one-await-in-loop
+    patterns:
+      - pattern: await $DB.$METHOD(...)
+      - pattern-either:
+          - pattern-inside: |
+              for (...) {
+                ...
+              }
+          - pattern-inside: |
+              for (const $ITEM of $LIST) {
+                ...
+              }
+    message: >
+      N+1 query pattern in JavaScript. Awaiting a database
+      call inside a for loop runs one query per iteration.
+      Use Promise.all() with .map() to run queries in parallel,
+      or restructure to use a single query with an IN clause.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: performance
+      smell_id: n_plus_one
+      fix_code: |
+        // Instead of:
+        for (const id of ids) {
+          const item = await db.find({ id });
+        }
+        // Use:
+        const items = await db.findMany({
+          where: { id: { in: ids } }
+        });
+
+  # --------------------------------------------------------------------------
+  # 4. JavaScript/TypeScript N+1 — awaited query inside an async .map()
+  # --------------------------------------------------------------------------
+  - id: javascript-n-plus-one-map-async
+    patterns:
+      - pattern: await $DB.$METHOD(...)
+      - pattern-inside: $LIST.map(async ($ITEM) => { ... })
+    message: >
+      N+1 pattern via async map. Each array item triggers
+      a separate database query. Use Promise.all() but
+      better: restructure to a single query using IN clause
+      or batch fetch before the map.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: performance
+      smell_id: n_plus_one
+
+  # --------------------------------------------------------------------------
+  # 5. Django — every column fetched
+  # --------------------------------------------------------------------------
+  - id: django-select-star
+    pattern: $MODEL.objects.all()
+    message: >
+      Fetching all columns with .all() loads unnecessary data.
+      Specify only needed columns with .only('col1', 'col2')
+      or .values('col1', 'col2') for better performance.
+      Also prevents covering index usage.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: performance
+      smell_id: select_star
+      fix_code: |
+        # Instead of:
+        users = User.objects.all()
+        # Use:
+        users = User.objects.only('name', 'email')
+
+  # --------------------------------------------------------------------------
+  # 6. Django — queryset returned with no LIMIT
+  # --------------------------------------------------------------------------
+  - id: django-unbounded-queryset
+    pattern-either:
+      - pattern: return $MODEL.objects.filter(...)
+      - pattern: return $MODEL.objects.all()
+    message: >
+      Returning an unbounded queryset with no LIMIT.
+      As your data grows this will return millions of rows,
+      consuming all memory and crashing your server.
+      Add pagination: queryset[:100] or use Django Paginator.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: performance
+      smell_id: missing_pagination
+      fix_code: |
+        # Instead of:
+        return Model.objects.filter(...)
+        # Use:
+        from django.core.paginator import Paginator
+        paginator = Paginator(queryset, 25)
+        return paginator.get_page(page_number)
+
+  # --------------------------------------------------------------------------
+  # 7. Prisma — findMany with no take/skip
+  #
+  # Semgrep object patterns match *subsets*, so `findMany({})` alone also
+  # matches `findMany({ take: 25, skip: 0 })` — a false positive on correctly
+  # paginated code. The `pattern-not` on `take` is what makes this rule safe.
+  # (Any pattern containing ": " must be quoted or YAML reads it as a mapping.)
+  # --------------------------------------------------------------------------
+  - id: prisma-unbounded-findmany
+    patterns:
+      - pattern-either:
+          - pattern: await prisma.$MODEL.findMany()
+          - pattern: await prisma.$MODEL.findMany({})
+      - pattern-not: "await prisma.$MODEL.findMany({ take: $LIMIT, ... })"
+    message: >
+      Prisma findMany() with no 'take' limit.
+      Will return all rows as data grows.
+      Add: take: 100 to limit results.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: performance
+      smell_id: missing_pagination
+      fix_code: |
+        // Instead of:
+        await prisma.user.findMany()
+        // Use:
+        await prisma.user.findMany({ take: 25, skip: offset })
+
+  # --------------------------------------------------------------------------
+  # 8. Python — SQL built by string concatenation
+  # --------------------------------------------------------------------------
+  - id: python-raw-sql-string-concat
+    pattern-either:
+      - pattern: cursor.execute("..." + $X)
+      - pattern: cursor.execute('...' + $X)
+    message: >
+      SQL injection risk. String concatenation in SQL query
+      allows attackers to inject malicious SQL.
+      Also prevents PostgreSQL from caching the query plan.
+      Use parameterized queries: cursor.execute(sql, [params])
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      smell_id: string_sql
+      fix_code: |
+        # Instead of:
+        cursor.execute("SELECT * FROM users WHERE id = " + user_id)
+        # Use:
+        cursor.execute("SELECT * FROM users WHERE id = %s", [user_id])
+
+  # --------------------------------------------------------------------------
+  # 9. Python — SQL built with an f-string
+  #
+  # `metavariable-regex` is what makes this precise: the pattern
+  # $CURSOR.execute($QUERY) matches every execute call, and the regex keeps
+  # only those whose first argument is an f-string that actually interpolates
+  # something. Matching on `f"..."` alone would also flag f"SELECT 1".
+  # --------------------------------------------------------------------------
+  - id: python-raw-sql-fstring
+    patterns:
+      - pattern: $CURSOR.execute($QUERY)
+      - metavariable-regex:
+          metavariable: $QUERY
+          regex: "^f['\"].*\\{.*\\}"
+    message: >
+      SQL injection risk via f-string.
+      Never interpolate variables directly into SQL.
+      Use parameterized queries instead.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      smell_id: string_sql
+      fix_code: |
+        # Instead of:
+        cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
+        # Use:
+        cursor.execute("SELECT * FROM users WHERE id = %s", [user_id])
+
+  # --------------------------------------------------------------------------
+  # 10. JavaScript/TypeScript — SQL built with a template literal
+  #
+  # Uses the raw text of the query argument because Semgrep does not match
+  # interpolated template literals via a literal backtick pattern.
+  # --------------------------------------------------------------------------
+  - id: javascript-sql-template-literal
+    patterns:
+      - pattern: $DB.query($QUERY)
+      - metavariable-regex:
+          metavariable: $QUERY
+          regex: "(?i)`\\s*(select|insert|update|delete)[^`]*\\$\\{"
+    message: >
+      SQL injection risk. Template literal interpolation
+      in SQL queries is dangerous. Use parameterized queries:
+      db.query('SELECT * FROM t WHERE id = $1', [id])
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      smell_id: string_sql
+      fix_code: |
+        // Instead of:
+        await db.query(`SELECT * FROM users WHERE id = ${userId}`)
+        // Use:
+        await db.query('SELECT * FROM users WHERE id = $1', [userId])
+
+  # --------------------------------------------------------------------------
+  # 11. Django — existence check that reads every row
+  #
+  # Each pattern needs a `...` body: `if cond:` with no statement under it is
+  # an incomplete if-statement and silently matches nothing.
+  # --------------------------------------------------------------------------
+  - id: django-count-instead-of-exists
+    pattern-either:
+      - pattern: |
+          if $Q.count() > 0:
+              ...
+      - pattern: |
+          if $Q.count() == 0:
+              ...
+      - pattern: |
+          if len($Q) > 0:
+              ...
+      - pattern: |
+          if len($Q) == 0:
+              ...
+    message: >
+      Inefficient existence check. .count() and len() load
+      all matching rows to count them.
+      Use .exists() which stops at the first match:
+      if queryset.exists():
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: performance
+      smell_id: inefficient_exists
+      fix_code: |
+        # Instead of:
+        if User.objects.filter(email=email).count() > 0:
+        # Use:
+        if User.objects.filter(email=email).exists():
+
+  # --------------------------------------------------------------------------
+  # 12. Django — queryset built in the loop head, FK traversed in the body
+  # --------------------------------------------------------------------------
+  - id: django-missing-select-related
+    patterns:
+      - pattern: |
+          for $ITEM in $MODEL.objects.$METHOD(...):
+              ...
+              $ITEM.$FK.$FIELD
+    message: >
+      Possible lazy loading of foreign key '$FK'.
+      Each loop iteration may trigger a separate DB query
+      to load the related '$FK' object.
+      Fix: Add .select_related('$FK') to your queryset.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: performance
+      smell_id: lazy_loading

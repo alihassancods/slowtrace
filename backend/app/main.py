@@ -7,15 +7,5 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI
-
-from api.connections import router as connections_router
-
-app = FastAPI(title="SlowTrace", version="0.1.0")
-
-app.include_router(connections_router)
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# Import the application from src/api/main.py which wires up all routes.
+from api.main import app  # noqa: F401 — re-exported as the uvicorn entry point
