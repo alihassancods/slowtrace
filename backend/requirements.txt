@@ -5,3 +5,6 @@ python-dotenv
 httpx
 pytest
 pytest-asyncio
+# Static analysis for codebase scanning (provides the `semgrep` CLI in the venv).
+# Needs git on the host to clone repositories. See docs/backend/semgrep.md.
+semgrep>=1.70.0

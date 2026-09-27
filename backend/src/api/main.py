@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.codebase import router as codebase_router
 from api.connections import router as connections_router
 from api.dashboard import router as dashboard_router
 from api.explain import router as explain_router
@@ -43,6 +44,7 @@ app.include_router(scan_router, prefix="/api")
 app.include_router(queries_router, prefix="/api")
 app.include_router(wizard_router, prefix="/api")
 app.include_router(fixes_router, prefix="/api")
+app.include_router(codebase_router, prefix="/api/codebase", tags=["codebase"])
 
 # Legacy DSN-based routes (kept for backwards compatibility)
 app.include_router(dashboard_router)

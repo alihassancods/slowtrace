@@ -49,6 +49,16 @@ For any slow query, runs 5 automated recommendation rules against its stats and 
 
 - `GET /api/fix/{dsn}/{queryid}` — returns a `FixReport` with scored, severity-ranked recommendations
 
+### 🧪 Planner-Validated Index Fixes
+
+Before suggesting a `CREATE INDEX`, the AI fix generator can *prove* it with [HypoPG](https://github.com/HypoPG/hypopg): a hypothetical index is created in the same session, the planner costs the query with and without it, then the index is dropped. Nothing is written to disk and nothing is visible to other sessions.
+
+- `POST /api/fixes/generate` returns `hypopg_validation` with baseline/improved planner cost, scan-type change, and estimated index size
+- When the planner confirms the index, Expected Impact is derived from the measured cost ratio instead of a fixed guess (`estimation_basis: "hypopg_planner"`)
+- pg_stat_statements stores parameters as `$1`, and the planner proves `col = NULL` as a 0-cost no-op, so each `$n` is replaced with a value sampled from your own table (`TABLESAMPLE`, never the first physical row) and the index is tested against 3 such values — the verdict is the median, with the observed range and the exact values shown
+- Degrades silently: without the extension the suggestion still works and the UI says the improvement is estimated
+- Optional — install `hypopg` on the monitored database, add it to `shared_preload_libraries`, restart, then `CREATE EXTENSION hypopg;` (SlowTrace also tries to create it when the user has permission)
+
 ### 📊 Dashboard
 Aggregates health and query data in a single parallel request — fans out to both the health and queries streams concurrently and returns a unified `DashboardReport`.
 
@@ -108,7 +118,9 @@ slowtrace/
 - Python 3.11+
 - Node.js 20+
 - Docker & Docker Compose
+- Git — **must be installed on the host**; the codebase scanner clones repositories with it
 - PostgreSQL with `pg_stat_statements` enabled
+- Optional: `hypopg` on the monitored database, for planner-proven index suggestions
 
 ### Backend
 
@@ -134,6 +146,26 @@ npm run dev
 ```bash
 docker compose up -d
 ```
+
+### Deployment notes
+
+- **System requirements: `git` and Python 3.11+ must be installed on the host.**
+  Codebase scanning clones repositories with `git`; `docker-compose.yml` only
+  provisions PostgreSQL, so the backend runs directly on the host (or in an image
+  that installs git itself).
+- Codebase scanning uses [Semgrep](https://semgrep.dev), installed as a Python
+  dependency from `backend/requirements.txt`. Its CLI lands in the virtualenv
+  (`backend/.venv/bin/semgrep`), **not** on the system `PATH`, and is resolved
+  relative to the running interpreter. If it is missing, `/api/codebase/scan`
+  returns a `semgrep_not_installed` error with an `install_command` to run:
+
+  ```bash
+  cd backend && uv pip install --python .venv/bin/python "semgrep>=1.70.0"
+  ```
+
+- Rules live in `backend/src/agent/codebase/rules/slowtrace-rules.yml`; the
+  scanner contract and verified Semgrep behaviour are documented in
+  [docs/backend/semgrep.md](docs/backend/semgrep.md).
 
 ---
 

@@ -5,6 +5,7 @@ import DashboardPage from '@/pages/DashboardPage'
 import QueryDetailPage from '@/pages/QueryDetailPage'
 import FixPage from '@/pages/FixPage'
 import WizardPage from '@/pages/WizardPage'
+import CodebasePage from '@/pages/CodebasePage'
 import FixResultPage from '@/pages/FixResultPage'
 import { clearActiveConnection, useActiveConnection } from '@/lib/activeConnection'
 
@@ -21,6 +22,7 @@ function Shell() {
       label: 'Dashboard',
       end: false,
     },
+    { to: '/codebase', label: '🔍 Codebase', end: false },
     {
       to: connectionId ? `/wizard/${connectionId}` : '/wizard',
       label: 'Wizard',
@@ -84,6 +86,7 @@ function Shell() {
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/dashboard/:id" element={<DashboardPage />} />
           <Route path="/dashboard/query/:id" element={<QueryDetailPage />} />
+          <Route path="/codebase" element={<CodebasePage />} />
           <Route path="/query/:connectionId/:queryid" element={<QueryDetailPage />} />
           <Route path="/fix/:id" element={<FixPage />} />
           <Route path="/fix/:connectionId/:queryid" element={<FixPage />} />

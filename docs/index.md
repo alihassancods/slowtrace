@@ -35,6 +35,7 @@ The frontend proxies all `/api/*` requests to the backend (Vite dev server), so 
 | [Fix API](backend/api-fix.md) | `GET /api/fix/{connection_id}/{queryid}` — fix recommendations |
 | [Dashboard API](backend/api-dashboard.md) | `GET /api/dashboard/{connection_id}` — aggregated report |
 | [DB Engine](backend/db_engine-connector.md) | `DBConnector` — async connection pool wrapper |
+| [Semgrep](backend/semgrep.md) | Scanner environment setup and verified JSON output contract |
 | [Testing](backend/testing.md) | Test suite structure and conventions |
 
 ### Frontend

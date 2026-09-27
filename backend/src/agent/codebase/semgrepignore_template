@@ -1,0 +1,20 @@
+# SlowTrace semgrep ignore file
+# Generated automatically during scan
+
+# Dependencies
+node_modules/
+vendor/
+.venv/
+venv/
+
+# Generated files
+*.min.js
+*.bundle.js
+dist/
+build/
+
+# Migrations (generated code, not developer code)
+*/migrations/*.py
+
+# Test fixtures
+fixtures/
